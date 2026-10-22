@@ -1,0 +1,23 @@
+# Binarios compilados (se publican en GitHub Releases, no en el repo)
+*.exe
+*.pdb
+bin/
+obj/
+
+# Configuración y notas personales (MAC de tu tira, datos privados)
+device.cfg
+settings.cfg
+CLAUDE.local.md
+.claude/
+.env
+*.key
+
+# Accesos directos y basura del sistema
+*.lnk
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+
+# Vídeo promocional (material personal, no forma parte del programa)
+video-reel/
