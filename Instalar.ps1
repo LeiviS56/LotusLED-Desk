@@ -147,7 +147,7 @@ try {
     $trigger  = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler | New-CimInstance -ClientOnly
     $trigger.Enabled = $true
     $trigger.Subscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name="USER32"] and (EventID=1074)]]</Select></Query></QueryList>'
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 4) -MultipleInstances IgnoreNew
     Register-ScheduledTask -TaskName 'LotusLED_Shutdown' -Action $action -Trigger $trigger -Settings $settings `
         -Description 'LotusLED Desk: respaldo para apagar las tiras LED al apagar el PC' -Force -ErrorAction Stop | Out-Null
     Write-Output "  - Tarea programada de respaldo: LotusLED_Shutdown"
