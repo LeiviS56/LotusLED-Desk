@@ -172,5 +172,12 @@ Start-Sleep -Milliseconds 500
 Start-Process -FilePath $helper -ArgumentList '-watch' -WorkingDirectory $dir | Out-Null
 
 Write-Output "`nInstalación completada."
-Write-Output "Las luces se encenderán solas al iniciar Windows (sin abrir nada) y se apagarán al apagar el PC."
+if (@(Get-KnownMacs).Count -eq 0) {
+    Write-Output ""
+    Write-Output "OJO: no hay ninguna MAC en device.cfg, así que el ayudante no sabe qué tira encender ni apagar."
+    Write-Output "Mientras tanto, solo se apagará si tienes la ventana de LotusLED Desk abierta y conectada al apagar."
+    Write-Output "Escribe la MAC de tu tira en device.cfg (o vuelve a ejecutar Instalar.bat con la tira libre)."
+} else {
+    Write-Output "Las luces se encenderán solas al iniciar Windows (sin abrir nada) y se apagarán al apagar el PC."
+}
 Write-Output "Si algo falla, mira lo que hizo el ayudante en: $(Join-Path $dataDir 'LotusShutdown.log')"

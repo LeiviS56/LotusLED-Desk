@@ -153,11 +153,17 @@ namespace LotusLED.Shutdown
         // La tarea de respaldo empieza antes (al pedirse el apagado, mientras Windows cierra los demás programas),
         // así que puede insistir más; en WM_ENDSESSION retiene lo mismo que el ayudante (EndWaitMs como mucho).
         const int TaskBudgetMs = 15000;
+        // La tarea apaga en cuanto se pide el apagado, pero se puede cancelar después (o ser un apagado con espera,
+        // "shutdown /t 600"). Si pasado este rato Windows no nos ha cerrado ni se está apagando, vuelve a encender y
+        // deja el ayudante en marcha. Por debajo del límite de 2 min de la tarea, contando lo que tarda en encender.
+        const int TaskStayMs = 80000;
         const int StartWindowMs = 180000;   // al iniciar sesión, cuánto tiempo seguimos intentando encender
         const int ResumeCheckMs = 30000;    // si seguimos vivos tanto después de WM_ENDSESSION, el apagado se canceló
 
         public const int WM_APP_OFFDONE = 0x8001;
         public const int WM_APP_RESUMECHECK = 0x8002;
+        public const int WM_APP_TASKCHECK = 0x8003;
+        public const int WM_APP_QUIT = 0x8004;
 
         static Mutex _mutex;
         static EventWaitHandle _powerOnEvent;
@@ -173,6 +179,8 @@ namespace LotusLED.Shutdown
         static string _stamp;                   // huella de los archivos de configuración de la última lectura
         static EventWaitHandle _armed;          // abierto mientras hay tiras que apagar (lo mira LotusLED.ps1)
         static volatile int _exitCode;          // de la tarea de respaldo: 0 si apagó todas (o no tenía que apagar)
+        static bool _shutdownSeen;              // tarea de respaldo: Windows ya nos preguntó o nos cierra
+        static bool _taskResumed;               // tarea de respaldo: el apagado no siguió y ya se volvió a encender
 
         /// <summary>Un apagado: cuándo empezó (la pregunta de Windows), cuándo acabó y cómo fue.</summary>
         class OffRound
@@ -219,6 +227,12 @@ namespace LotusLED.Shutdown
             {
                 Log.Write("Tarea de respaldo: el ayudante no estaba en marcha, apago desde aquí.");
                 StartOff(_window.Handle, "Se pide apagar o reiniciar");
+                var hwnd = _window.Handle;
+                StartThread(() =>
+                {
+                    Thread.Sleep(TaskStayMs);
+                    Native.PostMessage(hwnd, WM_APP_TASKCHECK, IntPtr.Zero, IntPtr.Zero);
+                });
             }
             else
             {
@@ -365,6 +379,13 @@ namespace LotusLED.Shutdown
             BeginEnding();
             string kind = (lParam & Native.ENDSESSION_LOGOFF) != 0 ? "cierre de sesión" : "apagado o reinicio";
             if ((lParam & Native.ENDSESSION_CRITICAL) != 0) kind += " forzado";
+            if (_mode == GuardMode.OffNow)
+            {
+                // La tarea ya apagó (o está apagando) desde que se pidió el apagado: Windows sigue adelante
+                _shutdownSeen = true;
+                if (_round == null && !_taskResumed) StartOff(hwnd, "Windows avisa de " + kind);
+                return;
+            }
             var old = _round;
             if (old != null)
             {
@@ -457,6 +478,7 @@ namespace LotusLED.Shutdown
 
             // Apagado forzado sin pregunta previa: empezamos ahora
             BeginEnding();
+            if (_mode == GuardMode.OffNow) _shutdownSeen = true;
             if (_round == null) StartOff(hwnd, "Windows termina la sesión sin preguntar");
             var round = _round;
             round.EndSeen = true;
@@ -508,29 +530,70 @@ namespace LotusLED.Shutdown
         /// </summary>
         static void Resume(IntPtr hwnd, string msg)
         {
+            var mode = _mode;
+            if (mode == GuardMode.OffNow)
+            {
+                if (_taskResumed) return;
+                _taskResumed = true;
+            }
             var round = _round;
             _round = null;
             if (round != null) round.Cancelled = true; // si aún estaba apagando, que lo deje
             ClearReason(hwnd);
             _ending = false;
             try { Lights.Abort.Reset(); } catch { }
-            StartThread(() => Log.Write(msg));
-            if (round == null || _mode == GuardMode.OffNow) return;
             StartThread(() =>
             {
-                round.Done.WaitOne(TaskBudgetMs + 3000);
-                var cfg = _cfg;
-                if (cfg == null || !cfg.LightsOn || _ending || round.Addrs.Count == 0) return;
-                Log.Results("Volver a encender", Lights.SetAll(round.Addrs, true, 20000, () => _ending, true));
+                Log.Write(msg);
+                if (round != null)
+                {
+                    round.Done.WaitOne(TaskBudgetMs + 3000);
+                    var cfg = _cfg;
+                    if (cfg != null && cfg.LightsOn && !_ending && round.Addrs.Count > 0)
+                        Log.Results("Volver a encender", Lights.SetAll(round.Addrs, true, 20000, () => _ending, true));
+                }
+                if (mode == GuardMode.OffNow)
+                {
+                    // No había ayudante: que se quede uno vigilando para el próximo apagado, y esta tarea se va
+                    StartResidentHelper();
+                    Native.PostMessage(hwnd, WM_APP_QUIT, IntPtr.Zero, IntPtr.Zero);
+                }
             });
         }
 
-        /// <summary>La tarea de respaldo terminó de apagar: se va (si Windows nos está esperando, después).</summary>
+        static void StartResidentHelper()
+        {
+            try
+            {
+                Mutex m;
+                if (Mutex.TryOpenExisting(Helper.MutexNameForGuard, out m)) { m.Dispose(); return; }
+                var psi = new ProcessStartInfo(Application.ExecutablePath, "-watch");
+                psi.UseShellExecute = false;
+                psi.WorkingDirectory = Config.ExeDir;
+                Process.Start(psi);
+                Log.Write("Tarea de respaldo: dejo el ayudante en marcha para el próximo apagado.");
+            }
+            catch (Exception ex) { Log.Write("Tarea de respaldo: no se pudo poner en marcha el ayudante (" + ex.Message + ")."); }
+        }
+
+        /// <summary>La tarea de respaldo terminó de apagar: quita el motivo y espera a ver si el apagado sigue.</summary>
         public static void OnOffDone(IntPtr hwnd)
         {
             if (_mode != GuardMode.OffNow) return;
             ClearReason(hwnd);
-            Quit();
+        }
+
+        /// <summary>
+        /// Tarea de respaldo, un rato después: si Windows nos preguntó o se está apagando, nada más que hacer. Si no,
+        /// el apagado se canceló o es con espera: se vuelven a encender y se deja el ayudante vigilando.
+        /// </summary>
+        public static void OnTaskCheck(IntPtr hwnd)
+        {
+            if (_mode != GuardMode.OffNow || _taskResumed) return;
+            bool shuttingDown = _shutdownSeen;
+            if (!shuttingDown) { try { shuttingDown = Native.GetSystemMetrics(Native.SM_SHUTTINGDOWN) != 0; } catch { } }
+            if (shuttingDown) { Quit(); return; }
+            Resume(hwnd, "Tarea de respaldo: Windows no llegó a apagarse (se canceló o es un apagado con espera).");
         }
 
         static void ClearReason(IntPtr hwnd)
@@ -615,6 +678,16 @@ namespace LotusLED.Shutdown
             if (m.Msg == Guard.WM_APP_RESUMECHECK)
             {
                 Guard.OnResumeCheck(Handle, m.WParam.ToInt32());
+                return;
+            }
+            if (m.Msg == Guard.WM_APP_TASKCHECK)
+            {
+                Guard.OnTaskCheck(Handle);
+                return;
+            }
+            if (m.Msg == Guard.WM_APP_QUIT)
+            {
+                Guard.Quit();
                 return;
             }
             if (m.Msg == Native.WM_CLOSE)

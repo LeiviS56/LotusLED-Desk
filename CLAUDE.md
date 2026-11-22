@@ -76,10 +76,15 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
 - Sin `RegisterApplicationRestart`: con él, al reiniciar con "reiniciar aplicaciones" Windows manda
   ENDSESSION_CLOSEAPP y el ayudante creería que es un instalador. CLOSEAPP solo se toma por un instalador si
   `GetSystemMetrics(SM_SHUTTINGDOWN)` es 0; entonces se cierra y vigila la tarea de respaldo.
-- `-task` (tarea de respaldo, evento 1074): si no hay ayudante, hace lo mismo que él (ventana oculta, nivel 0x100,
-  motivo) y termina al acabar. No se queda el mutex del ayudante. Como empieza antes, puede insistir hasta 15 s
-  (pero en WM_ENDSESSION retiene como el ayudante). Antes la tarea moría a medias (0xC000013A el 1-nov) o ni
-  arrancaba (15 y 21-nov).
+- `-task` (tarea de respaldo, evento 1074): si no hay ayudante, apaga en cuanto se pide el apagado (no se fía de
+  que a un proceso nacido a mitad del apagado le llegue la pregunta) con ventana oculta, nivel 0x100 y motivo.
+  No se queda el mutex del ayudante. Como empieza antes, puede insistir hasta 15 s (pero en WM_ENDSESSION retiene
+  como el ayudante). Luego se queda 80 s: si Windows no le ha preguntado ni se está apagando (SM_SHUTTINGDOWN),
+  o llega WM_ENDSESSION(FALSE), el apagado se canceló o es con espera (`/t 600`): vuelve a encender si LightsOn,
+  deja un ayudante `-watch` en marcha y termina. Antes la tarea moría a medias (0xC000013A el 1-nov) o ni arrancaba
+  (15 y 21-nov).
+- `LotusLED.ps1` solo deja de apagar desde la web si existe `Local\LotusLED_Ayudante_Apaga`, que el ayudante tiene
+  abierto mientras haya MAC y la opción de apagar esté activada (sin MAC, la web apaga como antes).
 - Escritura: la primera puede esperar a que Windows conecte (lo guardado con Cached no conecta), así que tiene casi
   todo el tiempo. Sin respuesta (FFF3 de la ELK-BLEDDM): dos tramas y una lectura sin caché de FFF3; si la lectura
   no vuelve o da Unreachable, se reintenta (AccessDenied lo dice Windows sin preguntar a la tira: se trata como si no
@@ -98,8 +103,8 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   Instalar) es ninguna. `Instalar` busca tiras (`-find`) si no hay MAC en device.cfg.
 - Windows comparte la conexión BLE entre programas: el ayudante puede escribir aunque la web tenga la tira conectada.
   No guardar conexiones abiertas entre apagados (la tira dejaría de anunciarse).
-- `LotusLED.ps1`: con el ayudante en marcha, su aviso SessionEnding no hace nada (apagar desde la web dejaría la tira
-  apagada aunque luego se cancelara el apagado). Nunca abre la ventana al iniciar Windows: sin ayudante válido, el
+- `LotusLED.ps1`: con el ayudante en marcha y con tiras, su aviso SessionEnding no hace nada (apagar desde la web
+  dejaría la tira apagada aunque luego se cancelara el apagado). Nunca abre la ventana al iniciar Windows: sin ayudante válido, el
   inicio automático no se activa. La espera larga de /api/poll se corta si llega otra petición.
 - Versión: `LotusLED.ps1` e `Instalar.ps1` exigen LotusShutdown.exe 1.1.1 o más (la 1.0 tomaba cualquier argumento
   por una MAC y apagaba las luces; la 1.1.0 no atendía el aviso para encender). La actual es la 1.1.2. Si no
