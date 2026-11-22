@@ -326,7 +326,7 @@ namespace LotusLED.Shutdown
                     var cfg = _cfg;
                     if (cfg == null || !cfg.PowerOnStart)
                     {
-                        Log.Write("Encender al iniciar está desactivado en la interfaz.");
+                        if (done.Count == 0) Log.Write("Encender al iniciar está desactivado en la interfaz.");
                         return;
                     }
                     pending.Clear();
@@ -341,13 +341,15 @@ namespace LotusLED.Shutdown
                     }
                     var res = Lights.SetAll(pending, true, 20000, stop, true);
                     if (_ending) break; // Windows se apaga: lo que pase con estas órdenes ya no cuenta
+                    bool first = done.Count == 0;
                     foreach (var r in res.Values)
                         if (r.Ok) { done.Add(r.Address); pending.Remove(r.Address); }
+                    // En cuanto se enciende la primera (no al final: la web puede apagarlas mientras se insiste con otra)
+                    if (first && done.Count > 0) NoteLightsOn();
                     if (round == 1 || pending.Count == 0) Log.Results("Encender al iniciar (intento " + round + ")", res);
                     if (pending.Count == 0) continue; // por si entretanto apareció otra tira; si no, termina arriba
                     for (int i = 0; i < 50 && !_ending; i++) Thread.Sleep(100);
                 }
-                if (done.Count > 0 && !_ending) NoteLightsOn();
                 if (pending.Count > 0 && !_ending)
                     Log.Write("No se pudo encender " + Log.List(pending) + " en " + (StartWindowMs / 1000) +
                               " s. ¿Está enchufada, o conectada al móvil?");
