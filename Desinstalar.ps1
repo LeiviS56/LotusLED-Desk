@@ -9,7 +9,9 @@ $links = @(
     (Join-Path ([Environment]::GetFolderPath('Desktop')) 'LotusLED Desk.lnk'),
     (Join-Path ([Environment]::GetFolderPath('Programs')) 'LotusLED Desk.lnk'),
     (Join-Path $startup 'LotusLED Luces.lnk'),
-    (Join-Path $startup 'LotusLED.lnk')
+    (Join-Path $startup 'LotusLED.lnk'),
+    (Join-Path $env:LOCALAPPDATA 'LotusLED\Ayudante.lnk'),
+    (Join-Path $env:LOCALAPPDATA 'LotusLED\Ayudante (encender).lnk')
 )
 foreach ($l in $links) {
     if (Test-Path $l) { Remove-Item -Force $l; Write-Output "  - Eliminado: $l" }

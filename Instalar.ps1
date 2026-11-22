@@ -155,6 +155,34 @@ try {
     Write-Output "  (No se pudo crear la tarea de respaldo: $($_.Exception.Message))"
 }
 
+# El ayudante se abre a través del Explorador, con un acceso directo, igual que lo abre Windows desde Inicio: así
+# no queda dentro del grupo de procesos (job) del programa que lo abre. El 22-nov lo abrió así Claude Code durante
+# unas pruebas, y al apagar el PC se cerró con Claude, antes de que Windows le avisara: no apagó las luces.
+# Si no se puede (sin Explorador), se abre directamente.
+function Start-HelperDetached([string]$Exe, [string]$Arguments, [string]$Dir) {
+    $data = Join-Path $env:LOCALAPPDATA 'LotusLED'
+    $name = if ($Arguments -match '-on') { 'Ayudante (encender).lnk' } else { 'Ayudante.lnk' }
+    $lnk = Join-Path $data $name
+    try {
+        New-Item -ItemType Directory -Force -Path $data | Out-Null
+        $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+        $s.TargetPath = $Exe
+        $s.Arguments = $Arguments
+        $s.WorkingDirectory = $Dir
+        $s.Save()
+        if (Get-Process -Name 'explorer' -ErrorAction SilentlyContinue) {
+            Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList "`"$lnk`""
+            # Que de verdad haya un ayudante (el nuevo, o el que ya estaba): si no aparece, se abre directamente
+            for ($i = 0; $i -lt 30; $i++) {
+                $m = $null
+                if ([System.Threading.Mutex]::TryOpenExisting('Local\LotusLED_Ayudante_Luces', [ref]$m)) { $m.Dispose(); return }
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    } catch {}
+    Start-Process -FilePath $Exe -ArgumentList $Arguments -WorkingDirectory $Dir | Out-Null
+}
+
 # 6. Arrancar el ayudante ya (cerrando uno anterior, por si era de otra versión o de otra carpeta).
 #    Sin -on: instalar no cambia las luces; se encenderán solas la próxima vez que inicies Windows.
 $unknown = 0
@@ -169,7 +197,7 @@ if ($unknown -gt 0) {
     Write-Output "  (Hay $unknown LotusShutdown.exe que no se pudo identificar; si las luces no van bien, reinicia el PC.)"
 }
 Start-Sleep -Milliseconds 500
-Start-Process -FilePath $helper -ArgumentList '-watch' -WorkingDirectory $dir | Out-Null
+Start-HelperDetached $helper '-watch' $dir
 
 Write-Output "`nInstalación completada."
 $anyDeviceCfg = (Test-Path $deviceCfg) -or (Test-Path (Join-Path $dataDir 'device.cfg'))
