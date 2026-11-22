@@ -172,7 +172,20 @@ Start-Sleep -Milliseconds 500
 Start-Process -FilePath $helper -ArgumentList '-watch' -WorkingDirectory $dir | Out-Null
 
 Write-Output "`nInstalación completada."
-if (@(Get-KnownMacs).Count -eq 0) {
+$anyDeviceCfg = (Test-Path $deviceCfg) -or (Test-Path (Join-Path $dataDir 'device.cfg'))
+$settingsCfg = Join-Path $dataDir 'settings.cfg'
+$lastAddress = $null
+if (-not $anyDeviceCfg -and (Test-Path $settingsCfg)) {
+    $m = Select-String -Path $settingsCfg -Pattern '^LastAddress=(\d+)' | Select-Object -First 1
+    if ($m) { $lastAddress = [uint64]$m.Matches[0].Groups[1].Value }
+}
+if (@(Get-KnownMacs).Count -eq 0 -and $lastAddress) {
+    # Sin device.cfg, el ayudante usa la última tira de LotusLED.exe (settings.cfg)
+    $hex = ('{0:X12}' -f $lastAddress) -replace '(..)(?!$)', '$1:'
+    Write-Output ""
+    Write-Output "OJO: no hay device.cfg, así que el ayudante usará la última tira que usó LotusLED.exe ($hex)."
+    Write-Output "Si no es la tuya (puede ser la de un vecino), escribe la MAC de tu tira en device.cfg."
+} elseif (@(Get-KnownMacs).Count -eq 0) {
     Write-Output ""
     Write-Output "OJO: no hay ninguna MAC en device.cfg, así que el ayudante no sabe qué tira encender ni apagar."
     Write-Output "Mientras tanto, solo se apagará si tienes la ventana de LotusLED Desk abierta y conectada al apagar."

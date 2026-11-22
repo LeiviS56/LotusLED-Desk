@@ -54,8 +54,8 @@ function Set-Autostart([bool]$enable) {
     if (Test-Path $oldStartupLnk) { Remove-Item -Force $oldStartupLnk -ErrorAction SilentlyContinue }
     if (-not $enable) {
         if (Test-Path $startupLnk) { Remove-Item -Force $startupLnk -ErrorAction SilentlyContinue }
-        # Si Windows no dejó borrarlo, sigue activado: que la web no diga lo contrario
-        return (-not (Test-Path $startupLnk))
+        # Si Windows no dejó borrar alguno, sigue activado: que la web no diga lo contrario
+        return (-not (Test-Path $startupLnk) -and -not (Test-Path $oldStartupLnk))
     }
     if (-not (Test-HelperOk)) {
         if (Test-Path $startupLnk) { Remove-Item -Force $startupLnk -ErrorAction SilentlyContinue }

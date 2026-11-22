@@ -40,8 +40,8 @@ using Windows.Storage.Streams;
 [assembly: AssemblyTitle("LotusLED Desk - luces")]
 [assembly: AssemblyDescription("Enciende las tiras LED al iniciar Windows y las apaga al apagar el PC")]
 [assembly: AssemblyProduct("LotusLED Desk")]
-[assembly: AssemblyVersion("1.1.2.0")]
-[assembly: AssemblyFileVersion("1.1.2.0")]
+[assembly: AssemblyVersion("1.1.3.0")]
+[assembly: AssemblyFileVersion("1.1.3.0")]
 
 namespace LotusLED.Shutdown
 {
@@ -52,6 +52,9 @@ namespace LotusLED.Shutdown
         // Existe solo mientras el ayudante va a apagar alguna tira al apagar el PC (hay MAC y la opción está
         // activada). LotusLED.ps1 lo mira: si no existe, apaga la ventana web, como antes de haber ayudante.
         const string ArmedName = "Local\\LotusLED_Ayudante_Apaga";
+        // La tarea de respaldo (evento 1074: se acaba de pedir apagar o reiniciar) se lo dice al ayudante, que se
+        // adelanta y va conectando con las tiras mientras Windows cierra los demás programas.
+        const string PrepareEventName = "Local\\LotusLED_Ayudante_Prepara";
 
         [STAThread]
         static int Main(string[] args)
@@ -95,8 +98,9 @@ namespace LotusLED.Shutdown
 
         /// <summary>
         /// Tarea de respaldo (evento 1074: alguien pidió apagar o reiniciar). Si el ayudante está en marcha, él se
-        /// encarga. Si no, este proceso hace lo mismo que él: ventana oculta, nivel de apagado bajo y motivo de
-        /// bloqueo, para que Windows no lo cierre a medias (antes moría con 0xC000013A sin llegar a apagar).
+        /// encarga: solo se le avisa para que vaya conectando. Si no, este proceso hace lo mismo que él: ventana
+        /// oculta, nivel de apagado bajo y motivo de bloqueo, para que Windows no lo cierre a medias (antes moría con
+        /// 0xC000013A sin llegar a apagar).
         /// </summary>
         static int RunTask(List<string> macs)
         {
@@ -104,6 +108,12 @@ namespace LotusLED.Shutdown
             if (Mutex.TryOpenExisting(MutexName, out m))
             {
                 m.Dispose();
+                try
+                {
+                    EventWaitHandle prepare;
+                    if (EventWaitHandle.TryOpenExisting(PrepareEventName, out prepare)) { prepare.Set(); prepare.Dispose(); }
+                }
+                catch { }
                 return 0;
             }
             if (!Config.Flag("PowerOffShutdown", true)) return 0;
@@ -127,6 +137,7 @@ namespace LotusLED.Shutdown
         internal static string MutexNameForGuard { get { return MutexName; } }
         internal static string PowerOnEventNameForGuard { get { return PowerOnEventName; } }
         internal static string ArmedNameForGuard { get { return ArmedName; } }
+        internal static string PrepareEventNameForGuard { get { return PrepareEventName; } }
     }
 
     enum GuardMode { Watch, PowerOn, OffNow }
@@ -148,7 +159,9 @@ namespace LotusLED.Shutdown
     static class Guard
     {
         const uint ShutdownLevel = 0x100;   // "aplicaciones, al final" (por defecto todos tienen 0x280)
-        const int OffBudgetMs = 6000;       // lo normal es 0,3-3 s; si Windows tiene que volver a buscar la tira, más
+        // Lo normal es 0,3-3 s, pero conectar en frío ha llegado a tardar 10 s en el PC del usuario. Con el motivo
+        // puesto, Windows espera (a partir de 5 s enseña su pantalla "Apagando las luces LED…").
+        const int OffBudgetMs = 10000;
         const int EndWaitMs = OffBudgetMs + 1300; // lo máximo que retenemos el apagado, desde la pregunta
         // La tarea de respaldo empieza antes (al pedirse el apagado, mientras Windows cierra los demás programas),
         // así que puede insistir más; en WM_ENDSESSION retiene lo mismo que el ayudante (EndWaitMs como mucho).
@@ -156,7 +169,8 @@ namespace LotusLED.Shutdown
         // La tarea apaga en cuanto se pide el apagado, pero se puede cancelar después (o ser un apagado con espera,
         // "shutdown /t 600"). Si pasado este rato Windows no nos ha cerrado ni se está apagando, vuelve a encender y
         // deja el ayudante en marcha. Por debajo del límite de 2 min de la tarea, contando lo que tarda en encender.
-        const int TaskStayMs = 80000;
+        const int TaskStayMs = 75000;
+        const int TaskRecheckMs = 10000;    // si a los 75 s Windows aún se está apagando, se vuelve a mirar (2 veces)
         const int StartWindowMs = 180000;   // al iniciar sesión, cuánto tiempo seguimos intentando encender
         const int ResumeCheckMs = 30000;    // si seguimos vivos tanto después de WM_ENDSESSION, el apagado se canceló
 
@@ -172,15 +186,16 @@ namespace LotusLED.Shutdown
         static List<string> _macs;
         static volatile Snapshot _cfg;          // opciones y tiras, leídas antes: en el apagado no se toca el disco
         static volatile bool _ending;           // Windows ha avisado de que se termina la sesión
-        static OffRound _round;                 // el apagado en curso (solo se toca desde el hilo de la ventana)
+        static volatile OffRound _round;        // el apagado en curso (solo se cambia desde el hilo de la ventana)
         static int _roundCount;                 // para saber de qué apagado habla un aviso que llega tarde
         static bool _reason;                    // hay motivo de bloqueo puesto
         static int _powerOnRunning;             // 1 mientras se intenta encender
         static string _stamp;                   // huella de los archivos de configuración de la última lectura
         static EventWaitHandle _armed;          // abierto mientras hay tiras que apagar (lo mira LotusLED.ps1)
         static volatile int _exitCode;          // de la tarea de respaldo: 0 si apagó todas (o no tenía que apagar)
-        static bool _shutdownSeen;              // tarea de respaldo: Windows ya nos preguntó o nos cierra
         static bool _taskResumed;               // tarea de respaldo: el apagado no siguió y ya se volvió a encender
+        static int _taskChecks;                 // tarea de respaldo: cuántas veces se miró si Windows se apaga
+        static EventWaitHandle _prepareEvent;   // la tarea de respaldo avisa de que se pidió apagar (ir conectando)
 
         /// <summary>Un apagado: cuándo empezó (la pregunta de Windows), cuándo acabó y cómo fue.</summary>
         class OffRound
@@ -211,6 +226,7 @@ namespace LotusLED.Shutdown
                     if (mode == GuardMode.PowerOn) { try { _powerOnEvent.Set(); } catch { } }
                     return 0;
                 }
+                _prepareEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Helper.PrepareEventNameForGuard);
             }
 
             _mode = mode;
@@ -249,11 +265,20 @@ namespace LotusLED.Shutdown
                         if (!_ending) PowerOnAtStart();
                     }
                 });
+                StartThread(() =>
+                {
+                    while (true)
+                    {
+                        _prepareEvent.WaitOne();
+                        Prepare();
+                    }
+                });
             }
 
             Application.Run();
             GC.KeepAlive(_mutex);
             GC.KeepAlive(_powerOnEvent);
+            GC.KeepAlive(_prepareEvent);
             return mode == GuardMode.OffNow ? _exitCode : 0;
         }
 
@@ -278,7 +303,9 @@ namespace LotusLED.Shutdown
                 Thread.Sleep(5000);
                 if (_ending) continue;
                 string now = Config.Stamp();
-                if (now == stamp) continue;
+                var cur = _cfg;
+                // Si la última vez no se pudo leer device.cfg (OneDrive aún sin arrancar), se insiste aunque no cambie
+                if (now == stamp && (cur == null || !cur.ReadError)) continue;
                 stamp = now;
                 var old = _cfg;
                 var cfg = Config.Load(_macs, old);
@@ -321,7 +348,8 @@ namespace LotusLED.Shutdown
                 var pending = new List<ulong>();
                 Func<bool> stop = () => _ending;
                 bool loggedNoMac = false;
-                for (int round = 1; !_ending && clock.ElapsedMilliseconds < StartWindowMs; round++)
+                int tries = 0;
+                while (!_ending && clock.ElapsedMilliseconds < StartWindowMs)
                 {
                     var cfg = _cfg;
                     if (cfg == null || !cfg.PowerOnStart)
@@ -339,6 +367,7 @@ namespace LotusLED.Shutdown
                         for (int i = 0; i < 50 && !_ending; i++) Thread.Sleep(100);
                         continue;
                     }
+                    tries++;
                     var res = Lights.SetAll(pending, true, 20000, stop, true);
                     if (_ending) break; // Windows se apaga: lo que pase con estas órdenes ya no cuenta
                     bool first = done.Count == 0;
@@ -346,7 +375,7 @@ namespace LotusLED.Shutdown
                         if (r.Ok) { done.Add(r.Address); pending.Remove(r.Address); }
                     // En cuanto se enciende la primera (no al final: la web puede apagarlas mientras se insiste con otra)
                     if (first && done.Count > 0) NoteLightsOn();
-                    if (round == 1 || pending.Count == 0) Log.Results("Encender al iniciar (intento " + round + ")", res);
+                    if (tries == 1 || pending.Count == 0) Log.Results("Encender al iniciar (intento " + tries + ")", res);
                     if (pending.Count == 0) continue; // por si entretanto apareció otra tira; si no, termina arriba
                     for (int i = 0; i < 50 && !_ending; i++) Thread.Sleep(100);
                 }
@@ -368,6 +397,35 @@ namespace LotusLED.Shutdown
             Config.SetFlag("LightsOn", true);
         }
 
+        /// <summary>
+        /// Se acaba de pedir apagar o reiniciar (aviso de la tarea de respaldo, evento 1074): mientras Windows cierra
+        /// los demás programas, se conecta ya con las tiras y se mantiene la conexión, para que cuando nos toque a
+        /// nosotros (los últimos) la orden de apagar salga al momento. No cambia las luces. Si en un minuto no ha
+        /// empezado el apagado (se canceló o es con espera), se suelta: con la conexión abierta, la tira no se anuncia
+        /// y el móvil no la vería.
+        /// </summary>
+        static void Prepare()
+        {
+            var cfg = _cfg;
+            if (_ending || cfg == null || !cfg.PowerOff || cfg.Addrs.Count == 0) return;
+            var addrs = new List<ulong>(cfg.Addrs);
+            Log.Write("Se pide apagar o reiniciar: voy conectando con " + Log.List(addrs) + " para que el apagado sea rápido.");
+            var held = new HeldLinks();
+            var clock = Stopwatch.StartNew();
+            try
+            {
+                Lights.Hold(addrs, held, 9000);
+                while (true)
+                {
+                    var round = _round;
+                    if (round != null) { if (round.Done.WaitOne(0)) break; }
+                    else if (clock.ElapsedMilliseconds > 60000) break;
+                    Thread.Sleep(250);
+                }
+            }
+            finally { held.Release(); }
+        }
+
         /// <summary>A partir de aquí no sale ninguna orden de encender, y las que estén a medias se cortan.</summary>
         static void BeginEnding()
         {
@@ -383,9 +441,13 @@ namespace LotusLED.Shutdown
             if ((lParam & Native.ENDSESSION_CRITICAL) != 0) kind += " forzado";
             if (_mode == GuardMode.OffNow)
             {
-                // La tarea ya apagó (o está apagando) desde que se pidió el apagado: Windows sigue adelante
-                _shutdownSeen = true;
-                if (_round == null && !_taskResumed) StartOff(hwnd, "Windows avisa de " + kind);
+                // La tarea ya apagó (o está apagando) desde que se pidió el apagado. Solo si entretanto volvió a
+                // encender (el primero no siguió) se apaga otra vez.
+                if (_round == null)
+                {
+                    _taskResumed = false;
+                    StartOff(hwnd, "Windows avisa de " + kind);
+                }
                 return;
             }
             var old = _round;
@@ -402,7 +464,7 @@ namespace LotusLED.Shutdown
                 {
                     // El de antes sigue apagando: vale para este también, pero sus avisos atrasados ya no
                     old.Id = ++_roundCount;
-                    if (_mode != GuardMode.OffNow) ScheduleResumeCheck(hwnd, old.Id, EndWaitMs + ResumeCheckMs);
+                    if (_mode != GuardMode.OffNow) ScheduleResumeCheck(hwnd, old.Id, EndWaitMs + ResumeCheckMs, true);
                     return;
                 }
             }
@@ -416,7 +478,7 @@ namespace LotusLED.Shutdown
             _round = round;
             // Después de la pregunta siempre llega WM_ENDSESSION; si por lo que sea no llegara y seguimos vivos,
             // que este apagado no se quede a medias para siempre (los siguientes no apagarían).
-            if (_mode != GuardMode.OffNow) ScheduleResumeCheck(hwnd, round.Id, EndWaitMs + ResumeCheckMs);
+            if (_mode != GuardMode.OffNow) ScheduleResumeCheck(hwnd, round.Id, EndWaitMs + ResumeCheckMs, true);
             var cfg = _cfg;
             if (cfg == null || !cfg.PowerOff || cfg.Addrs.Count == 0)
             {
@@ -425,7 +487,8 @@ namespace LotusLED.Shutdown
                 _exitCode = disabled ? 0 : 2;
                 round.Done.Set();
                 StartThread(() => Log.Write(why + note));
-                if (_mode == GuardMode.OffNow) Native.PostMessage(hwnd, WM_APP_OFFDONE, IntPtr.Zero, IntPtr.Zero);
+                // La tarea de respaldo no apagó nada, así que no hay nada que deshacer si se cancela: se va ya
+                if (_mode == GuardMode.OffNow) Native.PostMessage(hwnd, WM_APP_QUIT, IntPtr.Zero, IntPtr.Zero);
                 return;
             }
             if (!_reason)
@@ -480,8 +543,7 @@ namespace LotusLED.Shutdown
 
             // Apagado forzado sin pregunta previa: empezamos ahora
             BeginEnding();
-            if (_mode == GuardMode.OffNow) _shutdownSeen = true;
-            if (_round == null) StartOff(hwnd, "Windows termina la sesión sin preguntar");
+            if (_round == null) { _taskResumed = false; StartOff(hwnd, "Windows termina la sesión sin preguntar"); }
             var round = _round;
             round.EndSeen = true;
             long elapsed = round.Clock.ElapsedMilliseconds;
@@ -497,7 +559,7 @@ namespace LotusLED.Shutdown
 
             // Después de esto Windows nos cierra enseguida. Si dentro de un rato seguimos vivos, es que no llegó a
             // terminar la sesión (por ejemplo, alguien pulsó Cancelar en la pantalla de espera).
-            if (_mode != GuardMode.OffNow) ScheduleResumeCheck(hwnd, round.Id, ResumeCheckMs);
+            if (_mode != GuardMode.OffNow) ScheduleResumeCheck(hwnd, round.Id, ResumeCheckMs, false);
         }
 
         /// <summary>Apunta en el registro desde otro hilo, esperando como mucho maxWaitMs (sin procesar mensajes).</summary>
@@ -512,18 +574,22 @@ namespace LotusLED.Shutdown
             Native.Wait(written, maxWaitMs);
         }
 
-        static void ScheduleResumeCheck(IntPtr hwnd, int roundId, int delayMs)
+        /// <param name="noEnd">El que se programa al preguntar (por si no llega WM_ENDSESSION): si llegó, no vale.</param>
+        static void ScheduleResumeCheck(IntPtr hwnd, int roundId, int delayMs, bool noEnd)
         {
             StartThread(() =>
             {
                 Thread.Sleep(delayMs);
-                Native.PostMessage(hwnd, WM_APP_RESUMECHECK, (IntPtr)roundId, IntPtr.Zero);
+                Native.PostMessage(hwnd, WM_APP_RESUMECHECK, (IntPtr)roundId, (IntPtr)(noEnd ? 1 : 0));
             });
         }
 
-        public static void OnResumeCheck(IntPtr hwnd, int roundId)
+        public static void OnResumeCheck(IntPtr hwnd, int roundId, bool noEnd)
         {
-            if (_round != null && _round.Id == roundId) Resume(hwnd, "Seguimos en marcha: Windows no llegó a cerrar la sesión.");
+            var round = _round;
+            if (round == null || round.Id != roundId) return;
+            if (noEnd && round.EndSeen) return; // de eso se encarga el aviso programado en WM_ENDSESSION
+            Resume(hwnd, "Seguimos en marcha: Windows no llegó a cerrar la sesión.");
         }
 
         /// <summary>
@@ -554,9 +620,10 @@ namespace LotusLED.Shutdown
                     if (cfg != null && cfg.LightsOn && !_ending && round.Addrs.Count > 0)
                         Log.Results("Volver a encender", Lights.SetAll(round.Addrs, true, 20000, () => _ending, true));
                 }
-                if (mode == GuardMode.OffNow)
+                // No había ayudante: que se quede uno vigilando para el próximo apagado, y esta tarea se va. Salvo que
+                // entretanto haya empezado otro apagado: entonces esta tarea vuelve a apagar y Windows la cierra.
+                if (mode == GuardMode.OffNow && !_ending)
                 {
-                    // No había ayudante: que se quede uno vigilando para el próximo apagado, y esta tarea se va
                     StartResidentHelper();
                     Native.PostMessage(hwnd, WM_APP_QUIT, IntPtr.Zero, IntPtr.Zero);
                 }
@@ -586,15 +653,29 @@ namespace LotusLED.Shutdown
         }
 
         /// <summary>
-        /// Tarea de respaldo, un rato después: si Windows nos preguntó o se está apagando, nada más que hacer. Si no,
-        /// el apagado se canceló o es con espera: se vuelven a encender y se deja el ayudante vigilando.
+        /// Tarea de respaldo, un rato después: seguimos vivos, así que Windows no nos ha cerrado. Si se está apagando
+        /// (por ejemplo, con la pantalla de "programas que impiden apagar"), se vuelve a mirar dentro de poco; si no,
+        /// el apagado se canceló o es con espera: se vuelven a encender y se deja el ayudante vigilando. Todo antes del
+        /// límite de 2 min de la tarea.
         /// </summary>
         public static void OnTaskCheck(IntPtr hwnd)
         {
             if (_mode != GuardMode.OffNow || _taskResumed) return;
-            bool shuttingDown = _shutdownSeen;
-            if (!shuttingDown) { try { shuttingDown = Native.GetSystemMetrics(Native.SM_SHUTTINGDOWN) != 0; } catch { } }
-            if (shuttingDown) { Quit(); return; }
+            bool shuttingDown = false;
+            try { shuttingDown = Native.GetSystemMetrics(Native.SM_SHUTTINGDOWN) != 0; } catch { }
+            if (shuttingDown)
+            {
+                if (_taskChecks++ < 2)
+                {
+                    StartThread(() =>
+                    {
+                        Thread.Sleep(TaskRecheckMs);
+                        Native.PostMessage(hwnd, WM_APP_TASKCHECK, IntPtr.Zero, IntPtr.Zero);
+                    });
+                }
+                else Quit();
+                return;
+            }
             Resume(hwnd, "Tarea de respaldo: Windows no llegó a apagarse (se canceló o es un apagado con espera).");
         }
 
@@ -679,7 +760,7 @@ namespace LotusLED.Shutdown
             }
             if (m.Msg == Guard.WM_APP_RESUMECHECK)
             {
-                Guard.OnResumeCheck(Handle, m.WParam.ToInt32());
+                Guard.OnResumeCheck(Handle, m.WParam.ToInt32(), m.LParam != IntPtr.Zero);
                 return;
             }
             if (m.Msg == Guard.WM_APP_TASKCHECK)
@@ -714,6 +795,8 @@ namespace LotusLED.Shutdown
         public bool Melk;
         public bool Scanned;                // Windows no la conocía y hubo que escuchar su anuncio
         public string OpenStatus = "";      // lo que dijo OpenAsync al abrir el servicio (si no fue bien)
+        public long MsFind;                 // cuánto tardó Windows en darnos la tira (y buscarla, si hizo falta)
+        public long MsGatt;                 // cuánto tardaron sus servicios y características
 
         public void Dispose()
         {
@@ -721,6 +804,54 @@ namespace LotusLED.Shutdown
             Services.Clear();
             Char = null;
             if (Device != null) { try { Device.Dispose(); } catch { } Device = null; }
+        }
+    }
+
+    /// <summary>
+    /// Conexiones que se mantienen abiertas a propósito un rato (ver Guard.Prepare). Al soltarlas se deja de pedir
+    /// que se mantengan y se cierra todo; lo que llegue después de soltarlas se cierra al momento, para que nunca
+    /// quede una conexión abierta (la tira dejaría de anunciarse y nadie más la vería).
+    /// </summary>
+    class HeldLinks
+    {
+        readonly object _lock = new object();
+        readonly List<IDisposable> _items = new List<IDisposable>();
+        bool _closed;
+
+        /// <summary>Devuelve false (y ya lo ha cerrado) si llegó tarde.</summary>
+        public bool Add(IDisposable item)
+        {
+            if (item == null) return false;
+            lock (_lock)
+            {
+                if (!_closed) { _items.Add(item); return true; }
+            }
+            Close(item);
+            return false;
+        }
+
+        public void Release()
+        {
+            List<IDisposable> items;
+            lock (_lock)
+            {
+                _closed = true;
+                items = new List<IDisposable>(_items);
+                _items.Clear();
+            }
+            // Al revés: primero la sesión (deja de mantener la conexión), luego el dispositivo
+            for (int i = items.Count - 1; i >= 0; i--) Close(items[i]);
+        }
+
+        static void Close(IDisposable item)
+        {
+            try
+            {
+                var session = item as GattSession;
+                if (session != null) session.MaintainConnection = false;
+            }
+            catch { }
+            try { item.Dispose(); } catch { }
         }
     }
 
@@ -767,6 +898,62 @@ namespace LotusLED.Shutdown
                 if (ad == null) Log.Write("Aviso: no se encontró ningún adaptador Bluetooth.");
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Conecta ya con las tiras y le pide a Windows que mantenga la conexión (GattSession.MaintainConnection),
+        /// sin mandar ninguna orden. Lo que abre queda en held, que lo suelta todo al acabar (y cierra al momento lo
+        /// que llegue tarde). Vuelve como mucho a los budgetMs; la conexión sigue intentándose aunque no esperemos.
+        /// </summary>
+        public static void Hold(List<ulong> addrs, HeldLinks held, int budgetMs)
+        {
+            var clock = Stopwatch.StartNew();
+            var threads = new List<Thread>();
+            foreach (var addr in addrs)
+            {
+                ulong a = addr;
+                var t = new Thread(() =>
+                {
+                    _abort = null;
+                    string what;
+                    try { what = HoldOne(a, held, clock, budgetMs); }
+                    catch (Exception ex) { what = "error (" + ex.Message + ")"; }
+                    Log.Write("Conexión adelantada con " + Log.Short(a) + ": " + what + ".");
+                });
+                t.IsBackground = true;
+                t.SetApartmentState(ApartmentState.MTA);
+                t.Start();
+                threads.Add(t);
+            }
+            foreach (var t in threads)
+            {
+                int left = (int)(budgetMs + 1000 - clock.ElapsedMilliseconds);
+                if (left > 0) t.Join(left);
+            }
+        }
+
+        static string HoldOne(ulong addr, HeldLinks held, Stopwatch clock, int budgetMs)
+        {
+            bool scanned = false;
+            var dev = AwaitOp(BluetoothLEDevice.FromBluetoothAddressAsync(addr), Left(clock, budgetMs, 5000));
+            if (dev == null)
+            {
+                scanned = true;
+                if (Finder.WaitForAdvert(addr, Left(clock, budgetMs, 4000), null))
+                    dev = AwaitOp(BluetoothLEDevice.FromBluetoothAddressAsync(addr), Left(clock, budgetMs, 3000));
+            }
+            if (dev == null) return "Windows no la encuentra (" + clock.ElapsedMilliseconds + " ms)";
+            if (!held.Add(dev)) return "ya no hacía falta";
+            var session = AwaitOp(GattSession.FromDeviceIdAsync(dev.BluetoothDeviceId), Left(clock, budgetMs, 3000));
+            if (session == null) return "Windows no abrió la sesión (" + clock.ElapsedMilliseconds + " ms)";
+            if (!held.Add(session)) return "ya no hacía falta";
+            session.MaintainConnection = true;
+            // Solo para el registro: Windows sigue conectando aunque dejemos de mirar
+            while (dev.ConnectionStatus != BluetoothConnectionStatus.Connected && clock.ElapsedMilliseconds < budgetMs)
+                Thread.Sleep(100);
+            bool connected = dev.ConnectionStatus == BluetoothConnectionStatus.Connected;
+            return (connected ? "conectada en " : "aún sin conectar a los ") + clock.ElapsedMilliseconds + " ms" +
+                   (scanned ? ", hubo que buscarla" : "");
         }
 
         public static int CountOk(Dictionary<ulong, StripResult> res)
@@ -830,6 +1017,7 @@ namespace LotusLED.Shutdown
 
                 StripLink link = null;
                 bool ok = false;
+                long msSend = 0;
                 try
                 {
                     string err;
@@ -837,12 +1025,17 @@ namespace LotusLED.Shutdown
                     if (link == null) last = err;
                     else
                     {
-                        int t = (int)Math.Max(400, Math.Min(4500, budgetMs - clock.ElapsedMilliseconds - 100));
+                        // La primera escritura puede tener que esperar a que Windows conecte (en frío, varios segundos):
+                        // se le deja casi todo, guardando un poco para otro intento sin caché si esta no sale
+                        int t = (int)Math.Max(400, Math.Min(7000, budgetMs - clock.ElapsedMilliseconds - 100));
                         string why;
-                        if (Send(link, on, t, cancel, out why)) ok = true;
-                        else
+                        var sendClock = Stopwatch.StartNew();
+                        ok = Send(link, on, t, cancel, out why);
+                        msSend = sendClock.ElapsedMilliseconds;
+                        if (!ok)
                         {
-                            last = (cancel != null && cancel()) ? "cancelado" : why;
+                            last = (cancel != null && cancel()) ? "cancelado"
+                                 : why + " (buscar " + link.MsFind + " ms, servicios " + link.MsGatt + " ms, orden " + msSend + " ms)";
                             // Lo que Windows tenía guardado de la tira puede estar viejo: la próxima vez, preguntándole a ella
                             uncachedOnly = true;
                         }
@@ -860,7 +1053,8 @@ namespace LotusLED.Shutdown
                     {
                         r.Ok = true;
                         r.Ms = clock.ElapsedMilliseconds;
-                        r.Detail = (link.Melk ? "MELK" : "ELK") + (link.Scanned ? ", hubo que buscarla" : "");
+                        r.Detail = (link.Melk ? "MELK" : "ELK") + (link.Scanned ? ", hubo que buscarla" : "") +
+                                   ": buscar " + link.MsFind + " ms, servicios " + link.MsGatt + " ms, orden " + msSend + " ms";
                     }
                     else r.Detail = last;
                 }
@@ -887,20 +1081,30 @@ namespace LotusLED.Shutdown
                 string err = "";
                 StripLink link = null;
                 string readStatus = "";
-                for (int attempt = 1; attempt <= 3 && link == null && clock.ElapsedMilliseconds < 15000; attempt++)
+                var failed = new List<string>();   // cómo fue cada intento que no sirvió, con sus tiempos
+                int attempt = 0;
+                while (attempt < 3 && link == null && clock.ElapsedMilliseconds < 15000)
                 {
+                    attempt++;
+                    long t0 = clock.ElapsedMilliseconds;
                     link = Open(addr, clock, 20000, attempt > 1, out err);
-                    if (link == null) Thread.Sleep(500);
+                    if (link == null)
+                    {
+                        failed.Add("intento " + attempt + " (" + (clock.ElapsedMilliseconds - t0) + " ms): " + err);
+                        Thread.Sleep(500);
+                    }
                 }
+                string before = failed.Count > 0 ? " Antes: " + string.Join("; ", failed.ToArray()) + "." : "";
                 if (link == null)
                 {
-                    Log.Write("Prueba " + Log.Short(addr) + ": no se llega (" + err + ").");
+                    Log.Write("Prueba " + Log.Short(addr) + ": no se llega en " + clock.ElapsedMilliseconds + " ms." + before);
                     continue;
                 }
                 try
                 {
                     var p = link.Char.CharacteristicProperties;
                     string answer = null;
+                    var answerClock = Stopwatch.StartNew();
                     if ((p & GattCharacteristicProperties.Read) != 0)
                     {
                         // Success o ProtocolError: contestó la tira. AccessDenied lo dice Windows: se prueba de la otra forma.
@@ -920,12 +1124,14 @@ namespace LotusLED.Shutdown
                     bool good = answer == "contestó";
                     if (good) ok++;
                     Log.Write("Prueba " + link.Name + " " + Log.Short(addr) + ": " + (good ? "se llega" : "NO se llega") +
-                        " en " + clock.ElapsedMilliseconds + " ms, la tira " + answer + " (" + (link.Melk ? "MELK" : "ELK") +
+                        " en " + clock.ElapsedMilliseconds + " ms, la tira " + answer + " (intento " + attempt + ": buscar " +
+                        link.MsFind + " ms, servicios " + link.MsGatt + " ms, respuesta " + answerClock.ElapsedMilliseconds + " ms; " +
+                        (link.Melk ? "MELK" : "ELK") +
                         ", servicio " + Uuid16(link.Char.Service.Uuid) + ", característica " + Uuid16(link.Char.Uuid) +
                         ((p & GattCharacteristicProperties.Write) != 0 ? ", escritura con respuesta" : ", escritura sin respuesta") +
                         ((p & GattCharacteristicProperties.Read) != 0 ? ", se puede leer" : "") + readStatus +
                         (link.Scanned ? ", hubo que buscarla" : "") +
-                        (link.OpenStatus.Length > 0 ? ", abrir el servicio dio " + link.OpenStatus : "") + ").");
+                        (link.OpenStatus.Length > 0 ? ", abrir el servicio dio " + link.OpenStatus : "") + ")." + before);
                 }
                 finally { link.Dispose(); }
             }
@@ -947,6 +1153,7 @@ namespace LotusLED.Shutdown
         {
             error = "";
             var link = new StripLink { Address = addr };
+            var phase = Stopwatch.StartNew();
             try
             {
                 link.Device = AwaitOp(BluetoothLEDevice.FromBluetoothAddressAsync(addr), Left(clock, budgetMs, 5000));
@@ -966,9 +1173,14 @@ namespace LotusLED.Shutdown
                 }
                 link.Name = (link.Device.Name ?? "").Trim();
                 link.Melk = link.Name.StartsWith("MELK", StringComparison.OrdinalIgnoreCase);
+                link.MsFind = phase.ElapsedMilliseconds;
+                phase.Restart();
 
-                if (!uncachedOnly && FindWritable(link, BluetoothCacheMode.Cached, clock, budgetMs, out error)) return link;
-                if (!Aborted() && FindWritable(link, BluetoothCacheMode.Uncached, clock, budgetMs, out error)) return link;
+                bool found = (!uncachedOnly && FindWritable(link, BluetoothCacheMode.Cached, clock, budgetMs, out error)) ||
+                             (!Aborted() && FindWritable(link, BluetoothCacheMode.Uncached, clock, budgetMs, out error));
+                link.MsGatt = phase.ElapsedMilliseconds;
+                if (found) return link;
+                error += " (buscar " + link.MsFind + " ms, servicios " + link.MsGatt + " ms)";
                 link.Dispose();
                 return null;
             }
@@ -1339,6 +1551,7 @@ namespace LotusLED.Shutdown
         public bool PowerOnStart = true;
         public bool PowerOff = true;
         public bool LightsOn = true;
+        public bool ReadError;      // no se pudo leer device.cfg (se usaron las tiras de antes o la copia local)
     }
 
     static class Config
@@ -1384,6 +1597,7 @@ namespace LotusLED.Shutdown
             var s = new Snapshot();
             bool readError;
             s.Addrs = ReadAddresses(extra, out readError);
+            s.ReadError = readError;
             // Si no se pudo leer device.cfg, mejor las tiras de antes que ninguna
             if (readError && s.Addrs.Count == 0 && previous != null) s.Addrs = new List<ulong>(previous.Addrs);
             s.PowerOnStart = Flag("PowerOnStart", true);
@@ -1406,10 +1620,12 @@ namespace LotusLED.Shutdown
             try
             {
                 if (extra != null) foreach (var a in extra) Add(list, ParseMac(a));
-                int fromArgs = list.Count;
-                bool exists = ReadDeviceCfg(Path.Combine(ExeDir, "device.cfg"), list, ref readError);
-                exists = ReadDeviceCfg(Path.Combine(DataDir, "device.cfg"), list, ref readError) || exists;
-                if (exists && !readError) SaveCache(list.GetRange(fromArgs, list.Count - fromArgs));
+                var fromFiles = new List<ulong>();
+                bool exists = ReadDeviceCfg(Path.Combine(ExeDir, "device.cfg"), fromFiles, ref readError);
+                exists = ReadDeviceCfg(Path.Combine(DataDir, "device.cfg"), fromFiles, ref readError) || exists;
+                // La copia local guarda lo de device.cfg (aunque alguna MAC también venga por argumento)
+                if (exists && !readError) SaveCache(fromFiles);
+                foreach (var a in fromFiles) Add(list, a);
                 if (list.Count > 0) return list;
 
                 if (readError)

@@ -174,13 +174,13 @@
 
   let reportTimer;
   let reportPending = false;
-  function sendBackendState(keepalive) {
+  function sendBackendState() {
     reportPending = false;
     fetch('/api/state', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      // keepalive: que llegue aunque se esté cerrando la ventana
-      keepalive,
+      // keepalive: que llegue aunque se cierre la ventana justo después (el cuerpo es pequeño)
+      keepalive: true,
       body: JSON.stringify({
         connected: led.connected,
         power: state.power,
@@ -195,13 +195,13 @@
   function reportBackendState() {
     clearTimeout(reportTimer);
     reportPending = true;
-    reportTimer = setTimeout(() => sendBackendState(false), 250);
+    reportTimer = setTimeout(sendBackendState, 250);
   }
   // Si se cierra la ventana justo después de apagar o cambiar una opción, que el ayudante se entere igualmente
   window.addEventListener('pagehide', () => {
     if (!reportPending) return;
     clearTimeout(reportTimer);
-    sendBackendState(true);
+    sendBackendState();
   });
 
   function pushStateToDevice() {

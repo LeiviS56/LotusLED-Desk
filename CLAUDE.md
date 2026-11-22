@@ -59,14 +59,21 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
 - En WM_QUERYENDSESSION no se toca el disco: se pone el motivo ("Apagando las luces LED…"; sin motivo, a un
   programa sin ventana visible Windows lo mata a los 5 s), se lanza el apagado en otro hilo y se responde al
   momento (en un apagado forzado la pregunta solo tiene 1 s; `shutdown /s` sin `/t 0` ya es forzado). En
-  WM_ENDSESSION se espera, como mucho 7,3 s contados desde la pregunta (presupuesto del apagado: 6 s). Si dura más
-  de 5 s, Windows enseña su pantalla de espera unos segundos y sigue solo.
-- Opciones y MAC se leen antes (cada 5 s si cambian los archivos) en `Snapshot`; device.cfg está en OneDrive, así
+  WM_ENDSESSION se espera, como mucho 11,3 s contados desde la pregunta (presupuesto del apagado: 10 s; antes 6 s,
+  pero conectar en frío llegó a tardar 10 s en el PC del usuario). Si dura más de 5 s, Windows enseña su pantalla
+  de espera hasta que acabamos.
+- Conexión adelantada: la tarea de respaldo (evento 1074, que salta en cuanto se pide apagar) ve que el ayudante
+  está en marcha y le avisa con `Local\LotusLED_Ayudante_Prepara`. El ayudante conecta ya con las tiras y pide a
+  Windows que mantenga la conexión (`GattSession.MaintainConnection`) mientras cierra los demás programas, sin
+  cambiar las luces; cuando le toca, el apagado sale enseguida. Suelta la conexión al acabar el apagado o al minuto
+  si no empezó (con la conexión abierta la tira no se anuncia). `HeldLinks` cierra al momento lo que llegue tarde.
+- Opciones y MAC se leen antes (cada 5 s si cambian los archivos, o siempre si la última lectura de device.cfg
+  falló) en `Snapshot`; device.cfg está en OneDrive, así
   que se guarda una copia en %LOCALAPPDATA%\LotusLED\ultimas-tiras.cfg que solo se usa si no se puede leer.
 - Encender nunca llega después de apagar: el aviso de Windows activa `Lights.Abort` (corta al momento las esperas
   de las órdenes de encender) y el apagado se queda `Lights.Gate` hasta el final.
-- WM_ENDSESSION(FALSE), o seguir vivo 30 s después de WM_ENDSESSION(TRUE) (o 37 s después de la pregunta sin
-  WM_ENDSESSION), es que el apagado no siguió: corta el apagado si aún iba y vuelve a encender todas las tiras que
+- WM_ENDSESSION(FALSE), o seguir vivo 30 s después de WM_ENDSESSION(TRUE) (o 41 s después de la pregunta sin
+  WM_ENDSESSION; ese aviso no vale si llegó WM_ENDSESSION), es que el apagado no siguió: corta el apagado si aún iba y vuelve a encender todas las tiras que
   mandó apagar si LightsOn. Cada apagado lleva un número y esos avisos solo valen para el suyo; si Windows vuelve a
   preguntar antes, empieza un apagado nuevo. LightsOn lo actualizan la web (en cada encendido/apagado) y el ayudante
   (al encender al iniciar sesión). En la práctica casi nunca pasa.
@@ -79,22 +86,25 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
 - `-task` (tarea de respaldo, evento 1074): si no hay ayudante, apaga en cuanto se pide el apagado (no se fía de
   que a un proceso nacido a mitad del apagado le llegue la pregunta) con ventana oculta, nivel 0x100 y motivo.
   No se queda el mutex del ayudante. Como empieza antes, puede insistir hasta 15 s (pero en WM_ENDSESSION retiene
-  como el ayudante). Luego se queda 80 s: si Windows no le ha preguntado ni se está apagando (SM_SHUTTINGDOWN),
-  o llega WM_ENDSESSION(FALSE), el apagado se canceló o es con espera (`/t 600`): vuelve a encender si LightsOn,
-  deja un ayudante `-watch` en marcha y termina. Antes la tarea moría a medias (0xC000013A el 1-nov) o ni arrancaba
+  como el ayudante). Luego se queda: a los 75 s, si Windows no se está apagando (SM_SHUTTINGDOWN; si sí, mira otras
+  dos veces cada 10 s y se va), o si llega WM_ENDSESSION(FALSE), el apagado se canceló o es con espera
+  (`/t 600`): vuelve a encender si LightsOn, deja un ayudante `-watch` en marcha y termina. Si mientras tanto
+  empieza otro apagado, vuelve a apagar. Sin nada que apagar (sin MAC) termina al momento. Antes la tarea moría a medias (0xC000013A el 1-nov) o ni arrancaba
   (15 y 21-nov).
 - `LotusLED.ps1` solo deja de apagar desde la web si existe `Local\LotusLED_Ayudante_Apaga`, que el ayudante tiene
   abierto mientras haya MAC y la opción de apagar esté activada (sin MAC, la web apaga como antes).
 - Escritura: la primera puede esperar a que Windows conecte (lo guardado con Cached no conecta), así que tiene casi
   todo el tiempo. Sin respuesta (FFF3 de la ELK-BLEDDM): dos tramas y una lectura sin caché de FFF3; si la lectura
-  no vuelve o da Unreachable, se reintenta (AccessDenied lo dice Windows sin preguntar a la tira: se trata como si no
+  no vuelve o da Unreachable, se reintenta. El primer intento tiene hasta 7 s para escribir (puede tener que esperar
+  a que Windows conecte) (AccessDenied lo dice Windows sin preguntar a la tira: se trata como si no
   se pudiera leer). Antes de cada trama de encender se mira Abort. Si la característica admite las dos escrituras, la
   de con respuesta tiene 2/3 del tiempo. Si un intento falla, el siguiente busca sin caché. OpenAsync
   (SharedReadAndWrite) se pide antes de GetCharacteristicsAsync, como Chrome. Las MELK reciben su saludo antes.
 - Sin emparejar, `FromBluetoothAddressAsync` da null si Windows no ha visto la tira hace poco (tras reiniciar):
   se escucha su anuncio unos segundos y se reintenta ("hubo que buscarla" en el registro). Con la tira ausente,
   cada intento tarda 7 s y no se cancela.
-- `-probe` conecta y lee de la tira sin cambiar las luces (para comprobar la instalación).
+- `-probe` conecta y lee de la tira sin cambiar las luces (para comprobar la instalación). Apunta cada intento y lo
+  que tardó cada fase (buscar la tira, servicios, respuesta); encender y apagar también apuntan sus fases.
 - Opciones del ayudante en %LOCALAPPDATA%\LotusLED\auto.cfg (PowerOnStart, PowerOffShutdown, LightsOn), que
   escribe `LotusLED.ps1` con lo que manda la web (/api/state) y también `AppSettings.Save` del exe nativo.
 - Registro: %LOCALAPPDATA%\LotusLED\LotusShutdown.log (cada arranque, encendido y apagado, con tiempos).
@@ -108,13 +118,13 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   ayudante válido, el inicio automático no se activa. La espera larga de /api/poll se corta si llega otra petición
   (que no sea otro /api/poll).
 - Versión: `LotusLED.ps1` e `Instalar.ps1` exigen LotusShutdown.exe 1.1.1 o más (la 1.0 tomaba cualquier argumento
-  por una MAC y apagaba las luces; la 1.1.0 no atendía el aviso para encender). La actual es la 1.1.2. Si no
+  por una MAC y apagaba las luces; la 1.1.0 no atendía el aviso para encender). La actual es la 1.1.3. Si no
   compila, `Instalar` no instala nada.
 - `build.ps1` cierra solo el ayudante de esta carpeta (misma ruta del .exe) antes de compilar (si no, el .exe está
   bloqueado) y lo vuelve a abrir. Usa /codepage:65001 porque MainForm.cs, BleManager.cs y Program.cs no llevan BOM
   y tienen acentos.
-- Instalado en el PC del usuario el 22-nov (rama local suya con el rediseño estilo Apple, sin subir): la prueba
-  `-probe` llegó a la tira en 4,4 s.
+- Instalado en el PC del usuario el 22-nov (rama local suya con el rediseño estilo Apple, sin subir). Con la 1.1.2,
+  5 pruebas `-probe`: 4,5 s (hubo que buscarla), 10,0 s, 0,3 s, 2,3 s; siempre "leer dio Success".
 
 ## Pendiente
 1. Probar de verdad: apagar y encender el PC, y mirar LotusShutdown.log (tiempos del apagado, "hubo que buscarla").
