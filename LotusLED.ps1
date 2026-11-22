@@ -83,70 +83,90 @@ function Test-AutostartIsHelper {
     } catch { return $false }
 }
 
-# El ayudante se abre a través del Explorador, con un acceso directo, igual que lo abre Windows desde Inicio: así
-# no queda dentro del grupo de procesos (job) del programa que lo abre. El 22-nov lo abrió así Claude Code durante
-# unas pruebas, y al apagar el PC se cerró con Claude, antes de que Windows le avisara: no apagó las luces.
-# El acceso va junto al .exe y no en AppData: lo que crea en AppData un programa empaquetado (MSIX, como Claude)
-# Windows puede guardarlo en otro sitio, y el Explorador no lo encontraría. Si el Explorador no lo abre, lo abre el
-# servicio WMI (también queda fuera del job) y, si tampoco, se abre directamente. Si ya ha aparecido uno, no se abre
-# otro: uno lento de arrancar no tiene que perder contra el siguiente. Si ya hay uno en marcha no se abre otro (con
-# -on se le pide que encienda).
+# El ayudante se abre fuera del grupo de procesos (job) del programa que lo abre. El 22-nov lo abrió Claude Code
+# durante unas pruebas, quedó en el job de Claude y, al apagar el PC, se cerró con Claude antes de que Windows le
+# avisara: no apagó las luces. Primero lo crea el servicio WMI (Win32_Process.Create: en la sesión y el escritorio del
+# usuario y fuera de todo job, medido el 22-nov; no si se ejecuta como administrador). Si no, el Explorador, con un
+# acceso directo junto al .exe, como lo abre Windows desde Inicio (no en AppData: lo que crea allí un programa
+# empaquetado, MSIX, Windows puede guardarlo en otro sitio y el Explorador no lo vería). Solo al final se abre
+# directamente. Si ya ha aparecido uno no se abre otro: uno lento de arrancar no tiene que perder contra el siguiente.
+# Si ya hay uno en marcha no se abre otro. Con -on se le pide que encienda, también si el que queda en marcha es otro
+# que se abrió a la vez.
 function Start-HelperDetached([string]$Exe, [string]$Arguments, [string]$Dir) {
-    $m = $null
-    if ([System.Threading.Mutex]::TryOpenExisting('Local\LotusLED_Ayudante_Luces', [ref]$m)) {
-        $m.Dispose()
+    $isUp = {
+        $mm = $null
+        if ([System.Threading.Mutex]::TryOpenExisting('Local\LotusLED_Ayudante_Luces', [ref]$mm)) { $mm.Dispose(); $true } else { $false }
+    }
+    $askOn = {
         if ($Arguments -match '-on') {
             $e = $null
             if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\LotusLED_Ayudante_Encender', [ref]$e)) { [void]$e.Set(); $e.Dispose() }
         }
-        return
     }
+    if (& $isUp) { & $askOn; return }
     $session = (Get-Process -Id $PID).SessionId
-    # Si hay un ayudante (-watch) arrancando en esta sesión
+    # Si hay un ayudante (-watch) arrancando en esta sesión (uno con -probe o -find no cuenta)
     $starting = {
         @(Get-CimInstance Win32_Process -Filter "Name='LotusShutdown.exe' AND SessionId=$session" -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandLine -match '-watch' }).Count -gt 0
     }
-    # Hasta 10 s a que aparezca su mutex, y 10 s más si ya está arrancando
+    # Espera a que aparezca su mutex: con el proceso abierto, mientras siga vivo, hasta 20 s; sin él (Explorador), 10 s,
+    # y 10 s más si ya hay un ayudante arrancando
     $waitUp = {
+        param([int]$procId)
         for ($i = 0; $i -lt 200; $i++) {
-            $mm = $null
-            if ([System.Threading.Mutex]::TryOpenExisting('Local\LotusLED_Ayudante_Luces', [ref]$mm)) { $mm.Dispose(); return $true }
-            if ($i -ge 100 -and -not (& $starting)) { break }
+            if (& $isUp) { return $true }
+            if ($procId -gt 0) {
+                if (-not (Get-Process -Id $procId -ErrorAction SilentlyContinue)) { return (& $isUp) }
+            } elseif ($i -ge 100 -and -not (& $starting)) { break }
             Start-Sleep -Milliseconds 100
         }
-        return (& $starting)
+        return ((& $isUp) -or (& $starting))
     }
-    $name = if ($Arguments -match '-on') { 'Ayudante (encender).lnk' } else { 'Ayudante.lnk' }
+    $up = $false
+    # Como administrador, WMI lo abriría también como administrador (y los demás programas no podrían abrir su mutex
+    # ni sus avisos): entonces solo el Explorador, que lo abre como usuario normal
+    $elevated = $false
     try {
-        $shell = @(Get-Process -Name 'explorer' -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })
-        if ($shell.Count -gt 0) {
-            $lnk = $null
-            foreach ($folder in @($Dir, (Join-Path $env:LOCALAPPDATA 'LotusLED'))) {
-                try {
-                    New-Item -ItemType Directory -Force -Path $folder | Out-Null
-                    $path = Join-Path $folder $name
-                    $s = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
-                    $s.TargetPath = $Exe
-                    $s.Arguments = $Arguments
-                    $s.WorkingDirectory = $Dir
-                    $s.Save()
-                    if (Test-Path -LiteralPath $path) { $lnk = $path; break }
-                } catch {}
-            }
-            if ($lnk) {
-                Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList "`"$lnk`""
-                if (& $waitUp) { return }
-            }
-        }
+        $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
     } catch {}
-    try {
-        $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -ErrorAction Stop `
-            -Arguments @{ CommandLine = "`"$Exe`" $Arguments"; CurrentDirectory = $Dir }
-        if ($r.ReturnValue -eq 0 -and (& $waitUp)) { return }
-    } catch {}
-    if (& $starting) { return }
-    Start-Process -FilePath $Exe -ArgumentList $Arguments -WorkingDirectory $Dir | Out-Null
+    if (-not $elevated) {
+        try {
+            $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -ErrorAction Stop `
+                -Arguments @{ CommandLine = "`"$Exe`" $Arguments"; CurrentDirectory = $Dir }
+            if ($r.ReturnValue -eq 0) { $up = & $waitUp ([int]$r.ProcessId) }
+        } catch {}
+    }
+    if (-not $up) {
+        $name = if ($Arguments -match '-on') { 'Ayudante (encender).lnk' } else { 'Ayudante.lnk' }
+        try {
+            $shell = @(Get-Process -Name 'explorer' -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })
+            if ($shell.Count -gt 0) {
+                $lnk = $null
+                foreach ($folder in @($Dir, (Join-Path $env:LOCALAPPDATA 'LotusLED'))) {
+                    try {
+                        New-Item -ItemType Directory -Force -Path $folder | Out-Null
+                        $path = Join-Path $folder $name
+                        $s = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
+                        $s.TargetPath = $Exe
+                        $s.Arguments = $Arguments
+                        $s.WorkingDirectory = $Dir
+                        $s.Save()
+                        if (Test-Path -LiteralPath $path) { $lnk = $path; break }
+                    } catch {}
+                }
+                if ($lnk) {
+                    Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList "`"$lnk`""
+                    $up = & $waitUp 0
+                }
+            }
+        } catch {}
+    }
+    if (-not $up -and -not (& $starting)) {
+        Start-Process -FilePath $Exe -ArgumentList $Arguments -WorkingDirectory $Dir | Out-Null
+    }
+    if ($up) { & $askOn }
 }
 
 function Start-Helper([switch]$PowerOn) {
