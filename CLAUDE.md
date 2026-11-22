@@ -62,20 +62,26 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   WM_ENDSESSION se espera, como mucho 22,5 s contados desde la pregunta (presupuesto del apagado: 20 s; con la
   1.1.3 eran 10 s: en el PC del usuario conectar en frío tarda de 6 a 16 s). Si dura más de 5 s, Windows enseña su
   pantalla de espera (con "Apagar de todos modos") hasta que acabamos; solo pasa si la tira tarda en conectar.
-- Conexión con la tira (1.1.4, `Keeper`): una por tira para todo el proceso, con cuenta de quién la usa
-  (`Lights.Acquire`/`Release`, con un candado por tira para abrirla y cerrarla). Al abrirla se pide a Windows que
-  conecte y mantenga la conexión (`GattSession.MaintainConnection`); dura todos los intentos de una orden, así que
-  un intento que se pasa de tiempo no tira lo que Windows llevaba conectado. Medido el 22-nov con la 1.1.3: conectar
+- Conexión con la tira (`Keeper`, desde la 1.1.4): una por tira para todo el proceso, con cuenta de quién la usa
+  (`Lights.Acquire`/`Release`, con un candado por tira para abrirla y cerrarla); dura todos los intentos de una
+  orden, así que un intento que se pasa de tiempo no tira lo que Windows llevaba conectado. Lo que hace conectar a
+  Windows (según Microsoft): MaintainConnection, pedir los servicios sin caché, o leer/escribir; pedir lo guardado
+  (Cached) no. 1.1.5: la conexión la provocan las peticiones sin caché (Cached solo si ya está conectada) y la
+  sesión con MaintainConnection solo se pide ya conectada (`Lights.Maintain`, para la conexión adelantada). En la
+  1.1.4 la sesión iba desde el principio y la única petición era Cached: conectar tardó 0,08 / 1,5 / 4,0 / 8,6 /
+  13,3 / 29,1 s y dos veces nada en 30 s (la 1.1.3, con peticiones sin caché, conectaba en ~5-10 s). Medido el 22-nov con la 1.1.3: conectar
   tardaba 8-10 s casi siempre (una vez más de 16 s) y la petición de servicios se cortaba a los 3 s (Cached) y a los
   6 s (Uncached); el intento siguiente conectaba en menos de 1 s. Ahora la petición de servicios espera todo lo que
   quede menos 1 s, sin cortar, salvo que Windows ya diga que está conectada (ConnectionStatus, o la sesión Active,
   que es lo que mira Chrome) y no conteste en 4 s (atascada: se pide otra). Según Microsoft, cancelar una petición
   no cancela la conexión, y cada petición sin respuesta caduca a los ~7 s (Unreachable): se vuelve a pedir. Lo mismo con las escrituras. Con el último Release se cierra todo (la tira vuelve a anunciarse).
 - Conexión adelantada: la tarea de respaldo (evento 1074, que salta en cuanto se pide apagar) ve que el ayudante
-  está en marcha y le avisa con `Local\LotusLED_Ayudante_Prepara`. El ayudante abre ya la conexión con las tiras
-  (Acquire) mientras Windows cierra los demás programas, sin cambiar las luces; el apagado usa la misma. La suelta al
-  acabar el apagado, si el apagado no sigue, o al minuto si no empezó, y apunta cuándo conectó de verdad y cuándo la
-  soltó. Con la 1.1.3 no conectó en 9,1 s.
+  está en marcha y le avisa con `Local\LotusLED_Ayudante_Prepara`. El ayudante va conectando con las tiras mientras
+  Windows cierra los demás programas (`Lights.Poke`: pide los servicios sin caché una y otra vez; para cuando empieza
+  el apagado, que ya pide él), sin cambiar las luces, y ya conectadas pide MaintainConnection; el apagado usa la
+  misma conexión. La suelta al acabar el apagado, si el apagado no sigue, o al minuto si no empezó (otro aviso de la
+  tarea alarga el minuto), y apunta cuándo conectó y cuántas peticiones hicieron falta. Con la 1.1.3 no conectó en
+  9,1 s; con la 1.1.4, a los 13,3 s.
 - Opciones y MAC se leen antes (cada 5 s si cambian los archivos, o siempre si la última lectura de device.cfg
   falló) en `Snapshot`; device.cfg está en OneDrive, así
   que se guarda una copia en %LOCALAPPDATA%\LotusLED\ultimas-tiras.cfg que solo se usa si no se puede leer.
@@ -86,8 +92,8 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   mandó apagar si LightsOn. Cada apagado lleva un número y esos avisos solo valen para el suyo; si Windows vuelve a
   preguntar antes, empieza un apagado nuevo. LightsOn lo actualizan la web (en cada encendido/apagado) y el ayudante
   (al encender al iniciar sesión). En la práctica casi nunca pasa.
-- Con `-on`, al arrancar enciende las tiras (insiste hasta 3 min, la tira puede tardar en arrancar; en cada intento
-  mira las tiras de ese momento). Si ya hay un ayudante en marcha, el nuevo con `-on` se lo pide con el evento
+- Con `-on`, al arrancar enciende las tiras (insiste hasta 3 min, con intentos de 45 s, la tira puede tardar en
+  arrancar; en cada intento mira las tiras de ese momento). Volver a encender tras un apagado cancelado, también 45 s. Si ya hay un ayudante en marcha, el nuevo con `-on` se lo pide con el evento
   `Local\LotusLED_Ayudante_Encender` y termina.
 - Sin `RegisterApplicationRestart`: con él, al reiniciar con "reiniciar aplicaciones" Windows manda
   ENDSESSION_CLOSEAPP y el ayudante creería que es un instalador. CLOSEAPP solo se toma por un instalador si
@@ -96,7 +102,9 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   que a un proceso nacido a mitad del apagado le llegue la pregunta) con ventana oculta, nivel 0x100 y motivo.
   No se queda el mutex del ayudante. Como empieza antes, puede insistir hasta 25 s (pero en WM_ENDSESSION retiene
   como el ayudante); si aquel apagado acabó sin llegar a todas, al llegar WM_QUERYENDSESSION lo intenta otra vez.
-  La tarea tiene un límite de 4 min (antes 2: volver a encender después de 95 s podía pasarse). Luego se queda: a los 75 s, si Windows no se está apagando (SM_SHUTTINGDOWN; si sí, mira otras
+  Ese reintento tiene 20 s, como el ayudante (Windows ya nos espera), y el aviso de que acabó un apagado anterior
+  no quita el motivo del que está en marcha. La tarea tiene un límite de 4 min (antes 2: volver a encender después
+  de 95 s podía pasarse). Luego se queda: a los 75 s, si Windows no se está apagando (SM_SHUTTINGDOWN; si sí, mira otras
   dos veces cada 10 s y se va), o si llega WM_ENDSESSION(FALSE), el apagado se canceló o es con espera
   (`/t 600`): vuelve a encender si LightsOn, deja un ayudante `-watch` en marcha y termina. Si mientras tanto
   empieza otro apagado, vuelve a apagar. Sin nada que apagar (sin MAC) termina al momento. Antes la tarea moría a medias (0xC000013A el 1-nov) o ni arrancaba
@@ -114,7 +122,8 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
 - `-probe` conecta y lee de la tira sin cambiar las luces (para comprobar la instalación), con hasta 30 s. Apunta a
   los cuántos ms conectó Windows, cada intento y lo que tardó cada fase (buscar la tira, servicios, respuesta);
   encender y apagar también apuntan sus fases y cuándo conectó ("ya estaba conectada", "desde la conexión
-  adelantada"). `-probe -scan` escucha anuncios a la vez, para comparar si así Windows conecta antes.
+  adelantada"). Para comparar: `-probe -scan` escucha anuncios a la vez (con la 1.1.4 no se notó) y
+  `-probe -session` pide MaintainConnection desde el principio, como la 1.1.4.
 - Opciones del ayudante en %LOCALAPPDATA%\LotusLED\auto.cfg (PowerOnStart, PowerOffShutdown, LightsOn), que
   escribe `LotusLED.ps1` con lo que manda la web (/api/state) y también `AppSettings.Save` del exe nativo.
 - Registro: %LOCALAPPDATA%\LotusLED\LotusShutdown.log (cada arranque, encendido y apagado, con tiempos).
@@ -128,7 +137,7 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   ayudante válido, el inicio automático no se activa. La espera larga de /api/poll se corta si llega otra petición
   (que no sea otro /api/poll).
 - Versión: `LotusLED.ps1` e `Instalar.ps1` exigen LotusShutdown.exe 1.1.1 o más (la 1.0 tomaba cualquier argumento
-  por una MAC y apagaba las luces; la 1.1.0 no atendía el aviso para encender). La actual es la 1.1.4. Si no
+  por una MAC y apagaba las luces; la 1.1.0 no atendía el aviso para encender). La actual es la 1.1.5. Si no
   compila, `Instalar` no instala nada.
 - `build.ps1` cierra solo el ayudante de esta carpeta (misma ruta del .exe) antes de compilar (si no, el .exe está
   bloqueado) y lo vuelve a abrir. Usa /codepage:65001 porque MainForm.cs, BleManager.cs y Program.cs no llevan BOM
