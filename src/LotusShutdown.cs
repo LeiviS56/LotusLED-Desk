@@ -159,12 +159,14 @@ namespace LotusLED.Shutdown
         static volatile Snapshot _cfg;          // opciones y tiras, leídas antes: en el apagado no se toca el disco
         static volatile bool _ending;           // Windows ha avisado de que se termina la sesión
         static OffRound _round;                 // el apagado en curso (solo se toca desde el hilo de la ventana)
+        static int _roundCount;                 // para saber de qué apagado habla un aviso que llega tarde
         static bool _reason;                    // hay motivo de bloqueo puesto
         static int _powerOnRunning;             // 1 mientras se intenta encender
 
         /// <summary>Un apagado: cuándo empezó (la pregunta de Windows), cuándo acabó y cómo fue.</summary>
         class OffRound
         {
+            public int Id;
             public readonly ManualResetEvent Done = new ManualResetEvent(false);
             public readonly Stopwatch Clock = Stopwatch.StartNew();
             public volatile Dictionary<ulong, StripResult> Result;
@@ -306,8 +308,11 @@ namespace LotusLED.Shutdown
         static void StartOff(IntPtr hwnd, string why)
         {
             if (_round != null) return; // ya empezó en esta ronda
-            var round = new OffRound();
+            var round = new OffRound { Id = ++_roundCount };
             _round = round;
+            // Después de la pregunta siempre llega WM_ENDSESSION; si por lo que sea no llegara y seguimos vivos,
+            // que este apagado no se quede a medias para siempre (los siguientes no apagarían).
+            if (_mode != GuardMode.OffNow) ScheduleResumeCheck(hwnd, round.Id, EndWaitMs + ResumeCheckMs);
             var cfg = _cfg;
             if (cfg == null || !cfg.PowerOff || cfg.Addrs.Count == 0)
             {
@@ -374,19 +379,21 @@ namespace LotusLED.Shutdown
 
             // Después de esto Windows nos cierra enseguida. Si dentro de un rato seguimos vivos, es que no llegó a
             // terminar la sesión (por ejemplo, alguien pulsó Cancelar en la pantalla de espera).
-            if (_mode != GuardMode.OffNow)
-            {
-                StartThread(() =>
-                {
-                    Thread.Sleep(ResumeCheckMs);
-                    Native.PostMessage(hwnd, WM_APP_RESUMECHECK, IntPtr.Zero, IntPtr.Zero);
-                });
-            }
+            if (_mode != GuardMode.OffNow) ScheduleResumeCheck(hwnd, round.Id, ResumeCheckMs);
         }
 
-        public static void OnResumeCheck(IntPtr hwnd)
+        static void ScheduleResumeCheck(IntPtr hwnd, int roundId, int delayMs)
         {
-            if (_round != null) Resume(hwnd, "Seguimos en marcha: Windows no llegó a cerrar la sesión.");
+            StartThread(() =>
+            {
+                Thread.Sleep(delayMs);
+                Native.PostMessage(hwnd, WM_APP_RESUMECHECK, (IntPtr)roundId, IntPtr.Zero);
+            });
+        }
+
+        public static void OnResumeCheck(IntPtr hwnd, int roundId)
+        {
+            if (_round != null && _round.Id == roundId) Resume(hwnd, "Seguimos en marcha: Windows no llegó a cerrar la sesión.");
         }
 
         /// <summary>El apagado no siguió adelante: todo vuelve a la normalidad y, si estaban encendidas, se encienden.</summary>
@@ -493,7 +500,7 @@ namespace LotusLED.Shutdown
             }
             if (m.Msg == Guard.WM_APP_RESUMECHECK)
             {
-                Guard.OnResumeCheck(Handle);
+                Guard.OnResumeCheck(Handle, m.WParam.ToInt32());
                 return;
             }
             if (m.Msg == Native.WM_CLOSE)
