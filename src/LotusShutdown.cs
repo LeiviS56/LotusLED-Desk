@@ -318,10 +318,14 @@ namespace LotusLED.Shutdown
                 StartThread(() =>
                 {
                     Thread.Sleep(HandOffAtMs);
+                    // Si el apagado se acaba de cancelar, el aviso de Windows puede tardar en bajar: entonces solo si
+                    // sigue cerrando la sesión unos segundos seguidos (es otro apagado)
+                    int closing = 0;
                     while (Thread.VolatileRead(ref _handedOff) == 0)
                     {
-                        if (ShuttingDown()) HandOff();
-                        else Thread.Sleep(1000);
+                        if (!ShuttingDown()) closing = 0;
+                        else if (++closing >= (_taskResumed ? 6 : 1)) { HandOff(); break; }
+                        Thread.Sleep(1000);
                     }
                 });
             }
@@ -1094,25 +1098,7 @@ namespace LotusLED.Shutdown
                     // apagaron las luces desde la ventana (LightsOn=False)
                     if (mode == GuardMode.OffNow) { try { _cfg = Config.Load(_macs, _cfg); } catch { } }
                     var cfg = _cfg;
-                    // La tarea tiene que acabar antes de su límite de 4 min (si no, Windows la corta a medias)
-                    int onBudget = mode == GuardMode.OffNow
-                        ? (int)Math.Min(PowerOnTryMs, TaskLimitMs - TaskMarginMs - _age.ElapsedMilliseconds)
-                        : PowerOnTryMs;
-                    // Tarea: si ya dejó el ayudante cerca de su límite (HandOff), las enciende él (si no, encenderían los
-                    // dos a la vez). Se le pide otra vez ahora, con este apagado ya acabado: un reintento de apagar de la
-                    // tarea pudo llegar después de que él encendiera.
-                    bool handedOff = false;
-                    if (mode == GuardMode.OffNow && Thread.VolatileRead(ref _handedOff) != 0)
-                    {
-                        _handOffDone.WaitOne(30000);
-                        handedOff = _handOffSent;
-                    }
-                    bool wantOn = cfg != null && cfg.LightsOn && !_ending && round.Addrs.Count > 0;
-                    if (handedOff)
-                    {
-                        if (wantOn) helperOn = true;
-                    }
-                    else if (wantOn)
+                    if (cfg != null && cfg.LightsOn && !_ending && round.Addrs.Count > 0)
                     {
                         // Tarea: si Windows vuelve a estar cerrando la sesión (otro apagado), no se enciende (nos llegará
                         // la pregunta). Unos segundos de margen, por si aún no ha bajado el aviso del que se canceló.
@@ -1122,7 +1108,22 @@ namespace LotusLED.Shutdown
                             for (int i = 0; i < 50 && ShuttingDown() && !_ending; i++) Thread.Sleep(100);
                             closing = ShuttingDown();
                         }
-                        if (closing)
+                        // Tarea: si ya dejó el ayudante cerca de su límite (HandOff), las enciende él (si no, encenderían
+                        // los dos a la vez). Se le pide otra vez ahora, con este apagado ya acabado: un reintento de
+                        // apagar de la tarea pudo llegar después de que él encendiera. Se mira después de la espera de
+                        // arriba, por si lo dejó mientras tanto.
+                        bool handedOff = false;
+                        if (mode == GuardMode.OffNow && Thread.VolatileRead(ref _handedOff) != 0)
+                        {
+                            _handOffDone.WaitOne(30000);
+                            handedOff = _handOffSent;
+                        }
+                        // La tarea tiene que acabar antes de su límite de 4 min (si no, Windows la corta a medias)
+                        int onBudget = mode == GuardMode.OffNow
+                            ? (int)Math.Min(PowerOnTryMs, TaskLimitMs - TaskMarginMs - _age.ElapsedMilliseconds)
+                            : PowerOnTryMs;
+                        if (handedOff) helperOn = true;
+                        else if (closing)
                         {
                             helperOn = true; // si este otro apagado también se cancela, que las encienda el ayudante
                             Log.Write("Tarea de respaldo: no vuelvo a encender, Windows está cerrando la sesión otra vez.");
@@ -1459,8 +1460,11 @@ namespace LotusLED.Shutdown
                 // el reintento si el apagado no llegó a todas. Se mira cada 10 s. No se va: si el límite de 4 min la
                 // corta, queda igual que si se fuera; y si el apagado se cancela antes, vuelve a encender (o se lo deja
                 // al ayudante).
+                // Ya dejado el ayudante (HandOff) no se reintenta: si el apagado se cancela, enciende él, y a esta tarea
+                // pueden cortarla antes de enterarse (su apagado llegaría después y nadie volvería a encender).
                 var r = _round;
-                if (r != null && !_ending && !r.Cancelled && Native.Wait(r.Done, 0) && !AllOk(r))
+                if (r != null && !_ending && !r.Cancelled && Native.Wait(r.Done, 0) && !AllOk(r) &&
+                    Thread.VolatileRead(ref _handedOff) == 0)
                 {
                     // El apagado adelantado no llegó a todas: mientras Windows cierra los demás programas, otra vez
                     r.Superseded = true;
@@ -2316,7 +2320,7 @@ namespace LotusLED.Shutdown
                     if (watcher != null) { Finder.StopScan(watcher); watcher = null; }
                     if (failed.Count > 8) failed.RemoveRange(4, failed.Count - 8);  // los 4 primeros y los 4 últimos
                     string before = failed.Count > 0 ? " Antes: " + string.Join("; ", failed.ToArray()) + "." : "";
-                    string conn = keeper != null ? ConnNote(keeper, wasConnected) : ", sin encontrarla";
+                    string conn = keeper != null ? ConnNote(keeper, wasConnected) : (restarts > 0 ? ", sin conectar" : ", sin encontrarla");
                     if (restarts > 0) conn += ", " + restarts + (restarts == 1 ? " vez" : " veces") + " de cero";
                     if (link == null)
                     {
