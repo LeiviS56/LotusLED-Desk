@@ -5,6 +5,7 @@ using System.IO;
 using System.Management;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
@@ -44,8 +45,8 @@ using Windows.Storage.Streams;
 [assembly: AssemblyTitle("LotusLED Desk - luces")]
 [assembly: AssemblyDescription("Enciende las tiras LED al iniciar Windows y las apaga al apagar el PC")]
 [assembly: AssemblyProduct("LotusLED Desk")]
-[assembly: AssemblyVersion("1.1.9.0")]
-[assembly: AssemblyFileVersion("1.1.9.0")]
+[assembly: AssemblyVersion("1.1.10.0")]
+[assembly: AssemblyFileVersion("1.1.10.0")]
 
 namespace LotusLED.Shutdown
 {
@@ -68,7 +69,7 @@ namespace LotusLED.Shutdown
         {
             bool watch = false, on = false, task = false, probe = false, scan = false, session = false;
             string findFile = null;
-            int findSeconds = 8;
+            int findSeconds = 8, probeWait = 30, probeFresh = 0, probeHold = 0;
             var macs = new List<string>();
             for (int i = 0; i < args.Length; i++)
             {
@@ -81,6 +82,18 @@ namespace LotusLED.Shutdown
                 else if (k == "probe" || k == "probar") probe = true;
                 else if (k == "scan" || k == "escanear") scan = true;
                 else if (k == "session" || k == "sesion" || k == "sesión") session = true;
+                // Para medir con -probe: cuánto esperar (s), cada cuánto empezar de cero (s) y cuánto guardar la conexión (s)
+                else if ((k == "wait" || k == "fresh" || k == "hold") && i + 1 < args.Length)
+                {
+                    int n;
+                    if (int.TryParse(args[i + 1], out n))
+                    {
+                        i++;
+                        if (k == "wait") probeWait = Math.Max(5, Math.Min(600, n));
+                        else if (k == "fresh") probeFresh = Math.Max(0, Math.Min(300, n));
+                        else probeHold = Math.Max(0, Math.Min(7200, n));
+                    }
+                }
                 else if (k == "find" || k == "buscar")
                 {
                     findFile = (i + 1 < args.Length) ? args[++i] : Path.Combine(Config.DataDir, "tiras-encontradas.txt");
@@ -93,7 +106,7 @@ namespace LotusLED.Shutdown
             try
             {
                 if (findFile != null) return Finder.Run(findFile, findSeconds);
-                if (probe) return Lights.Probe(Config.Addresses(macs), scan, session);
+                if (probe) return Lights.Probe(Config.Addresses(macs), scan, session, probeWait * 1000, probeFresh * 1000, probeHold);
                 if (watch) return Guard.Run(macs, on ? GuardMode.PowerOn : GuardMode.Watch);
                 if (task) return RunTask(macs);
                 return RunOnce(macs, on);
@@ -263,10 +276,10 @@ namespace LotusLED.Shutdown
                 bool created;
                 try
                 {
-                    _powerOnEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Helper.PowerOnEventNameForGuard);
-                    _prepareEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Helper.PrepareEventNameForGuard);
-                    _restoreEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Helper.RestoreEventNameForGuard);
-                    _mutex = new Mutex(true, Helper.MutexNameForGuard, out created);
+                    _powerOnEvent = NewEvent(EventResetMode.AutoReset, Helper.PowerOnEventNameForGuard);
+                    _prepareEvent = NewEvent(EventResetMode.AutoReset, Helper.PrepareEventNameForGuard);
+                    _restoreEvent = NewEvent(EventResetMode.AutoReset, Helper.RestoreEventNameForGuard);
+                    _mutex = NewMutex(Helper.MutexNameForGuard, out created);
                 }
                 catch (UnauthorizedAccessException)
                 {
@@ -300,6 +313,17 @@ namespace LotusLED.Shutdown
                 Log.Write("Tarea de respaldo: el ayudante no estaba en marcha, apago desde aquí.");
                 StartOff(_window.Handle, "Se pide apagar o reiniciar", true);
                 ScheduleTaskCheck(_window.Handle, ++_taskCheckGen, TaskStayMs);
+                // Cerca del límite de 4 min, si Windows sigue cerrando la sesión, se deja ya un ayudante (ver HandOff).
+                // Con su propio reloj: no depende de cuándo toque la vigilancia siguiente.
+                StartThread(() =>
+                {
+                    Thread.Sleep(HandOffAtMs);
+                    while (Thread.VolatileRead(ref _handedOff) == 0)
+                    {
+                        if (ShuttingDown()) HandOff();
+                        else Thread.Sleep(1000);
+                    }
+                });
             }
             else
             {
@@ -379,13 +403,50 @@ namespace LotusLED.Shutdown
         }
 
         /// <summary>Que LotusLED.ps1 sepa si de verdad vamos a apagar algo (si no, que apague la ventana web).</summary>
+        /// <summary>
+        /// Los avisos y el mutex del ayudante dan permiso al usuario de la sesión: si el ayudante quedara abierto como
+        /// administrador, los demás programas (sin elevar) pueden seguir viéndolo y mandándole avisos. Si ya existen y
+        /// son de otro al que no se puede acceder, UnauthorizedAccessException.
+        /// </summary>
+        static EventWaitHandle NewEvent(EventResetMode mode, string name)
+        {
+            EventWaitHandleSecurity sec = null;
+            try
+            {
+                using (var id = WindowsIdentity.GetCurrent())
+                {
+                    sec = new EventWaitHandleSecurity();
+                    sec.AddAccessRule(new EventWaitHandleAccessRule(id.User, EventWaitHandleRights.FullControl, AccessControlType.Allow));
+                }
+            }
+            catch { sec = null; }
+            bool created;
+            return sec != null ? new EventWaitHandle(false, mode, name, out created, sec)
+                               : new EventWaitHandle(false, mode, name);
+        }
+
+        static Mutex NewMutex(string name, out bool created)
+        {
+            MutexSecurity sec = null;
+            try
+            {
+                using (var id = WindowsIdentity.GetCurrent())
+                {
+                    sec = new MutexSecurity();
+                    sec.AddAccessRule(new MutexAccessRule(id.User, MutexRights.FullControl, AccessControlType.Allow));
+                }
+            }
+            catch { sec = null; }
+            return sec != null ? new Mutex(true, name, out created, sec) : new Mutex(true, name, out created);
+        }
+
         static void UpdateArmed(Snapshot cfg)
         {
             bool want = cfg != null && cfg.PowerOff && cfg.Addrs.Count > 0;
             try
             {
                 if (want && _armed == null)
-                    _armed = new EventWaitHandle(false, EventResetMode.ManualReset, Helper.ArmedNameForGuard);
+                    _armed = NewEvent(EventResetMode.ManualReset, Helper.ArmedNameForGuard);
                 else if (!want && _armed != null)
                 {
                     _armed.Dispose();
@@ -467,7 +528,11 @@ namespace LotusLED.Shutdown
                     restore = true;
                     done.Clear();
                 }
-                if (askLogon || askRestore) what = logon && !restore ? "Encender al iniciar" : "Volver a encender";
+                if (askLogon || askRestore)
+                {
+                    what = logon && !restore ? "Encender al iniciar" : "Volver a encender";
+                    tries = 0; // que el intento siguiente se apunte
+                }
                 var cfg = _cfg;
                 if (cfg == null || !((logon && cfg.PowerOnStart) || (restore && cfg.LightsOn)))
                 {
@@ -737,6 +802,8 @@ namespace LotusLED.Shutdown
                 // Tras volver a la normalidad su vigilancia se había parado: vuelve (WM_ENDSESSION la reprograma)
                 if (_taskResumed) ScheduleTaskCheck(hwnd, ++_taskCheckGen, TaskRecheckMs);
                 _taskResumed = false;
+                // Lo que se le pidió al ayudante al dejarlo (HandOff) era por el apagado anterior: este vuelve a apagar
+                _handOffSent = false;
                 StartOff(hwnd, what);
             }
             else
@@ -839,15 +906,19 @@ namespace LotusLED.Shutdown
                             foreach (var kv in res) if (!kv.Value.Ok) pending.Add(kv.Key);
                             // Una orden de encender que no soltó el turno en 4 s pudo salir después de este apagado: en
                             // cuanto lo suelta, se vuelven a apagar (una vez) las que ya se habían apagado. Si aún quedan
-                            // tiras por apagar no se espera: se mira otra vez tras el siguiente intento. Si no, se espera
-                            // hasta 0,5 s antes del final (que puede crecer), y se deja de esperar si el apagado no sigue.
+                            // tiras por apagar y tiempo para otro intento no se espera: se mira otra vez después. Si no, se
+                            // espera hasta 0,5 s antes del final (que puede crecer), y se deja de esperar si el apagado no sigue.
                             bool resendNow = false;
                             if (!gate && !round.Cancelled)
                             {
                                 bool got = Monitor.TryEnter(Lights.Gate, 0);
-                                while (!got && pending.Count == 0 && !round.Cancelled &&
-                                       Interlocked.Read(ref round.Deadline) - round.Clock.ElapsedMilliseconds > 500)
+                                while (!got && !round.Cancelled)
+                                {
+                                    long left = Interlocked.Read(ref round.Deadline) - round.Clock.ElapsedMilliseconds;
+                                    // Con tiras por apagar solo se espera si ya no queda tiempo para otro intento
+                                    if (left <= 500 || (pending.Count > 0 && left >= 2000)) break;
                                     got = Monitor.TryEnter(Lights.Gate, 100);
+                                }
                                 if (got)
                                 {
                                     gate = true;
@@ -944,12 +1015,7 @@ namespace LotusLED.Shutdown
             // terminar la sesión (por ejemplo, alguien pulsó Cancelar en la pantalla de espera). La tarea lo mira con
             // su propio aviso (también si es su segundo apagado: el primero ya gastó los suyos).
             if (_mode != GuardMode.OffNow) ScheduleResumeCheck(hwnd, round.Id, ResumeCheckMs, false);
-            else
-            {
-                // La de los 75 s ya no vale. Si llega antes el momento de dejar el ayudante (ver HandOff), se mira entonces.
-                long untilHandOff = HandOffAtMs - _age.ElapsedMilliseconds;
-                ScheduleTaskCheck(hwnd, ++_taskCheckGen, (int)Math.Max(5000, Math.Min(ResumeCheckMs, untilHandOff)));
-            }
+            else ScheduleTaskCheck(hwnd, ++_taskCheckGen, ResumeCheckMs); // la de los 75 s ya no vale
         }
 
         /// <summary>Apunta en el registro desde otro hilo, esperando como mucho maxWaitMs (sin procesar mensajes).</summary>
@@ -1083,13 +1149,9 @@ namespace LotusLED.Shutdown
                 // No había ayudante: que se quede uno vigilando para el próximo apagado, y esta tarea se va. Salvo que
                 // entretanto haya empezado otro apagado: mientras Windows cierra la sesión se espera (nos llegará la
                 // pregunta y esta tarea volverá a apagar; si se cancela antes, sigue). Cerca del límite de 4 min se deja
-                // ya el ayudante, con el aviso de volver a encender (HandOff), y se sigue esperando hasta que la corten.
+                // ya el ayudante, con el aviso de volver a encender (HandOff, con su reloj), y se sigue hasta que la corten.
                 if (mode == GuardMode.OffNow)
-                    while (ShuttingDown() && !_ending && gen == Thread.VolatileRead(ref _resumeGen))
-                    {
-                        if (_age.ElapsedMilliseconds >= HandOffAtMs) HandOff();
-                        Thread.Sleep(500);
-                    }
+                    while (ShuttingDown() && !_ending && gen == Thread.VolatileRead(ref _resumeGen)) Thread.Sleep(500);
                 if (mode == GuardMode.OffNow && !_ending && gen == Thread.VolatileRead(ref _resumeGen))
                 {
                     // Si ya lo dejó HandOff con el aviso de volver a encender, no se le pide otra vez
@@ -1407,10 +1469,7 @@ namespace LotusLED.Shutdown
                     StartOff(hwnd, "Windows sigue cerrando la sesión: vuelvo a intentar apagar", true);
                     r = _round;
                 }
-                // Cerca del límite (el Programador de tareas la cortará) se deja ya un ayudante con el aviso de volver a
-                // encender: espera mientras Windows cierra la sesión, enciende si este apagado se cancela (y LightsOn) y,
-                // si le llega la pregunta, apaga él
-                if (_age.ElapsedMilliseconds >= HandOffAtMs && Thread.VolatileRead(ref _handedOff) == 0) StartThread(HandOff);
+                // Cerca del límite (el Programador de tareas la cortará) se deja ya un ayudante (HandOff, con su reloj)
                 ScheduleTaskCheck(hwnd, gen, TaskRecheckMs);
                 return;
             }
@@ -1418,9 +1477,10 @@ namespace LotusLED.Shutdown
         }
 
         /// <summary>
-        /// Tarea de respaldo cerca de su límite de 4 min mientras Windows sigue cerrando la sesión: se deja ya un ayudante
-        /// con el aviso de volver a encender (espera mientras Windows cierra la sesión, enciende si el apagado se cancela
-        /// y LightsOn y, si le llega la pregunta, apaga él). La tarea sigue hasta que la corten. Solo una vez.
+        /// Tarea de respaldo cerca de su límite de 4 min (a los ~200 s) mientras Windows sigue cerrando la sesión: se deja
+        /// ya un ayudante con el aviso de volver a encender (espera mientras Windows cierra la sesión, enciende si el
+        /// apagado se cancela y LightsOn y, si le llega la pregunta, apaga él). La tarea sigue hasta que la corten. Solo
+        /// una vez. Si la tarea ya había vuelto a encender, ese aviso solo las enciende otra vez (no cambia nada).
         /// </summary>
         static void HandOff()
         {
@@ -2158,15 +2218,19 @@ namespace LotusLED.Shutdown
         /// tardó cada fase y, sobre todo, a los cuántos ms conectó Windows. Para comparar formas de conectar: con scan,
         /// escucha anuncios mientras tanto; con session, pide MaintainConnection desde el principio, como la 1.1.4, pero
         /// sigue pidiendo los servicios sin caché hasta que conecta (la 1.1.4 pedía lo guardado, que no hace conectar).
+        /// Con scan apunta además cuántos anuncios de la tira se oyeron (si no se anuncia, la tiene otro o está apagada).
+        /// budgetMs: cuánto se espera (30 s). freshMs: si en ese rato no conecta, se cierra todo y se empieza de cero
+        /// (0: no). holdSeconds: ya conectada, se guarda la conexión ese rato (MaintainConnection), leyendo de la tira
+        /// cada 30 s, y se apunta si se cayó y lo que tardó cada lectura.
         /// </summary>
-        public static int Probe(List<ulong> addrs, bool scan, bool session)
+        public static int Probe(List<ulong> addrs, bool scan, bool session, int budgetMs = 30000, int freshMs = 0, int holdSeconds = 0)
         {
             if (addrs.Count == 0)
             {
                 Log.Write("Prueba: no hay ninguna MAC en device.cfg.");
                 return 2;
             }
-            const int ProbeBudgetMs = 30000;
+            int ProbeBudgetMs = budgetMs;
             int ok = 0;
             foreach (var addr in addrs)
             {
@@ -2176,37 +2240,88 @@ namespace LotusLED.Shutdown
                 Keeper keeper = null;
                 string readStatus = "";
                 var failed = new List<string>();   // cómo fue cada intento que no sirvió, con sus tiempos
-                int attempt = 0;
-                BluetoothLEAdvertisementWatcher watcher = scan ? Finder.StartScan() : null;
+                int attempt = 0, restarts = 0;
+                // Con scan: cuántos anuncios de esta tira se oyen mientras tanto, cuándo y con qué señal
+                int adverts = 0, rssi = 0;
+                long firstAd = -1, lastAd = -1;
+                var adLock = new object();
+                ulong target = addr;
+                BluetoothLEAdvertisementWatcher watcher = null;
+                if (scan)
+                {
+                    try
+                    {
+                        watcher = new BluetoothLEAdvertisementWatcher();
+                        watcher.ScanningMode = BluetoothLEScanningMode.Active;
+                        watcher.Received += (w, e) =>
+                        {
+                            if (e.BluetoothAddress != target) return;
+                            lock (adLock)
+                            {
+                                adverts++;
+                                lastAd = clock.ElapsedMilliseconds;
+                                if (firstAd < 0) firstAd = lastAd;
+                                rssi = e.RawSignalStrengthInDBm;
+                            }
+                        };
+                        watcher.Start();
+                    }
+                    catch { watcher = null; }
+                }
+                Func<string> adNote = () =>
+                {
+                    if (!scan) return "";
+                    lock (adLock)
+                        return adverts == 0 ? ", escuchando anuncios a la vez: ninguno de la tira"
+                             : ", escuchando anuncios a la vez: " + adverts + " de la tira (el primero a los " + firstAd +
+                               " ms, el último a los " + lastAd + " ms, " + rssi + " dBm)";
+                };
+                string opts = (budgetMs != 30000 ? ", hasta " + (budgetMs / 1000) + " s" : "") +
+                              (freshMs > 0 ? ", de cero cada " + (freshMs / 1000) + " s" : "");
                 try
                 {
-                    keeper = Acquire(addr, "prueba", clock, ProbeBudgetMs, out err);
-                    if (keeper == null)
+                    bool wasConnected = false;
+                    while (attempt < 60 && link == null && clock.ElapsedMilliseconds < ProbeBudgetMs - 1000)
                     {
-                        Log.Write("Prueba " + Log.Short(addr) + ": no se llega en " + clock.ElapsedMilliseconds + " ms (" + err + ")." +
-                                  (scan ? " Escuchando anuncios a la vez." : ""));
-                        continue;
-                    }
-                    bool wasConnected = keeper.IsConnected;
-                    if (session) Maintain(keeper, 3000);
-                    while (attempt < 10 && link == null && clock.ElapsedMilliseconds < ProbeBudgetMs - 1000)
-                    {
+                        if (keeper == null)
+                        {
+                            keeper = Acquire(addr, "prueba", clock, ProbeBudgetMs, out err);
+                            if (keeper == null)
+                            {
+                                failed.Add("buscarla (" + clock.ElapsedMilliseconds + " ms): " + err);
+                                if (freshMs <= 0) break;
+                                Thread.Sleep(500);
+                                continue;
+                            }
+                            wasConnected = keeper.IsConnected;
+                            if (session) Maintain(keeper, 3000);
+                        }
                         attempt++;
                         long t0 = clock.ElapsedMilliseconds;
-                        link = Open(keeper, clock, ProbeBudgetMs, attempt > 1, out err);
+                        // Con freshMs, cada intento tiene ese rato; si no conectó, se cierra todo y se empieza de cero
+                        int tryBudget = freshMs > 0 ? (int)Math.Min(ProbeBudgetMs, t0 + freshMs) : ProbeBudgetMs;
+                        link = Open(keeper, clock, tryBudget, attempt > 1, out err);
                         if (link == null)
                         {
                             failed.Add("intento " + attempt + " (" + (clock.ElapsedMilliseconds - t0) + " ms): " + err);
+                            if (freshMs > 0 && !keeper.IsConnected && clock.ElapsedMilliseconds < ProbeBudgetMs - 1500)
+                            {
+                                Release(keeper);
+                                keeper = null;
+                                restarts++;
+                            }
                             Thread.Sleep(200);
                         }
                     }
                     if (watcher != null) { Finder.StopScan(watcher); watcher = null; }
+                    if (failed.Count > 8) failed.RemoveRange(4, failed.Count - 8);  // los 4 primeros y los 4 últimos
                     string before = failed.Count > 0 ? " Antes: " + string.Join("; ", failed.ToArray()) + "." : "";
-                    string conn = ConnNote(keeper, wasConnected);
+                    string conn = keeper != null ? ConnNote(keeper, wasConnected) : ", sin encontrarla";
+                    if (restarts > 0) conn += ", " + restarts + (restarts == 1 ? " vez" : " veces") + " de cero";
                     if (link == null)
                     {
                         Log.Write("Prueba " + Log.Short(addr) + ": no se llega en " + clock.ElapsedMilliseconds + " ms (" +
-                                  conn.TrimStart(',', ' ') + (scan ? ", escuchando anuncios a la vez" : "") +
+                                  conn.TrimStart(',', ' ') + adNote() + opts +
                                   (session ? ", con MaintainConnection desde el principio" : "") + ")." + before);
                         continue;
                     }
@@ -2244,9 +2359,10 @@ namespace LotusLED.Shutdown
                         ((p & GattCharacteristicProperties.Read) != 0 ? ", se puede leer" : "") + readStatus +
                         (keeper.Scanned ? ", hubo que buscarla" : "") +
                         (session && keeper.Session == null ? ", no se pudo abrir la sesión" : "") +
-                        (scan ? ", escuchando anuncios a la vez" : "") +
+                        adNote() + opts +
                         (session ? ", con MaintainConnection desde el principio" : "") +
                         (link.OpenStatus.Length > 0 ? ", abrir el servicio dio " + link.OpenStatus : "") + ")." + before);
+                    if (good && holdSeconds > 0) Hold(keeper, link, holdSeconds);
                 }
                 finally
                 {
@@ -2256,6 +2372,70 @@ namespace LotusLED.Shutdown
                 }
             }
             return ok == addrs.Count ? 0 : 3;
+        }
+
+        /// <summary>
+        /// Para medir (-probe -hold N): guarda la conexión N segundos, como haría un ayudante que no la soltara nunca,
+        /// leyendo de la tira cada 30 s (no cambia las luces). Apunta cada caída, lo que tardó en volver y cada lectura.
+        /// </summary>
+        static void Hold(Keeper keeper, StripLink link, int seconds)
+        {
+            Maintain(keeper, 5000);
+            var clock = Stopwatch.StartNew();
+            int drops = 0, reads = 0, readsOk = 0;
+            long downMs = 0, downAt = -1, maxRead = 0, sumRead = 0, nextRead = 30000;
+            bool canRead = (link.Char.CharacteristicProperties & GattCharacteristicProperties.Read) != 0;
+            Log.Write("Prueba " + Log.Short(keeper.Address) + ": guardo la conexión " + seconds + " s" +
+                      (keeper.Session == null ? " (no se pudo abrir la sesión)" : "") + ".");
+            while (clock.ElapsedMilliseconds < seconds * 1000L)
+            {
+                bool up = keeper.IsConnected;
+                long now = clock.ElapsedMilliseconds;
+                if (!up && downAt < 0)
+                {
+                    downAt = now;
+                    drops++;
+                    Log.Write("Prueba " + Log.Short(keeper.Address) + ": la conexión se cayó a los " + (now / 1000) + " s.");
+                }
+                else if (up && downAt >= 0)
+                {
+                    downMs += now - downAt;
+                    Log.Write("Prueba " + Log.Short(keeper.Address) + ": volvió a conectar a los " + (now / 1000) + " s (" + (now - downAt) + " ms caída).");
+                    downAt = -1;
+                }
+                if (keeper.Session == null) Maintain(keeper, 3000);
+                if (now >= nextRead)
+                {
+                    nextRead = now + 30000;
+                    reads++;
+                    var rc = Stopwatch.StartNew();
+                    bool good = false;
+                    try
+                    {
+                        if (canRead)
+                        {
+                            var rd = AwaitOp(link.Char.ReadValueAsync(BluetoothCacheMode.Uncached), 10000);
+                            good = rd != null && (rd.Status == GattCommunicationStatus.Success || rd.Status == GattCommunicationStatus.ProtocolError);
+                        }
+                        else
+                        {
+                            var sv = AwaitOp(keeper.Device.GetGattServicesAsync(BluetoothCacheMode.Uncached), 10000, null, 0, keeper.Hold);
+                            keeper.Hold(sv);
+                            good = sv != null && sv.Status == GattCommunicationStatus.Success;
+                        }
+                    }
+                    catch { }
+                    long ms = rc.ElapsedMilliseconds;
+                    if (good) { readsOk++; sumRead += ms; if (ms > maxRead) maxRead = ms; }
+                    else Log.Write("Prueba " + Log.Short(keeper.Address) + ": a los " + (now / 1000) + " s la tira no contestó (" + ms + " ms).");
+                }
+                Thread.Sleep(500);
+            }
+            if (downAt >= 0) downMs += clock.ElapsedMilliseconds - downAt;
+            Log.Write("Prueba " + Log.Short(keeper.Address) + ": conexión guardada " + (clock.ElapsedMilliseconds / 1000) + " s: " +
+                      drops + (drops == 1 ? " caída" : " caídas") + " (" + downMs + " ms sin conexión), " +
+                      readsOk + " de " + reads + " lecturas contestadas" +
+                      (readsOk > 0 ? " (media " + (sumRead / readsOk) + " ms, máxima " + maxRead + " ms)" : "") + ".");
         }
 
         static string Uuid16(Guid uuid)

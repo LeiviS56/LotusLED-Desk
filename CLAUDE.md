@@ -132,12 +132,12 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   mutex). Mientras Windows sigue cerrando la sesión, si el apagado adelantado no llegó a todas, lo vuelve a intentar
   en cada vigilancia (cada 10 s). Mientras Windows cierra la sesión no se va nunca (antes se iba en mitad de un
   apagado que Windows había retrasado ~200 s): si el apagado se cancela antes del límite de 4 min, vuelve a encender
-  o se lo deja al ayudante; y poco antes del límite (a los ~200 s, `HandOff`, una vez) deja ya un ayudante con el
-  aviso Restaura, que espera mientras Windows cierra la sesión, enciende si se cancela y apaga si le llega la
-  pregunta. También si está esperando tras volver a la normalidad (otro apagado, sin pregunta). Si ya se lo pidió, al
-  cancelarse la tarea no enciende (lo hace el ayudante) ni se lo pide otra vez. Tras WM_ENDSESSION(TRUE) la
-  vigilancia siguiente llega como tarde a los ~200 s; si la pregunta llega tras volver a la normalidad, la vigilancia
-  vuelve a empezar. Luego se queda: a los 75 s, si Windows no se está
+  o se lo deja al ayudante; y poco antes del límite (a los ~200 s, `HandOff`, una vez, con su propio reloj: no
+  depende de la vigilancia) deja ya un ayudante con el aviso Restaura, que espera mientras Windows cierra la sesión,
+  enciende si se cancela y apaga si le llega la pregunta. También si está esperando tras volver a la normalidad (otro
+  apagado, sin pregunta). Si ya se lo pidió, al cancelarse la tarea no enciende (lo hace el ayudante) ni se lo pide
+  otra vez; si después empieza otro apagado y la tarea vuelve a apagar, eso ya no vale (vuelve a encender ella). Si la
+  pregunta llega tras volver a la normalidad, la vigilancia vuelve a empezar. Luego se queda: a los 75 s, si Windows no se está
   apagando (SM_SHUTTINGDOWN; si sí, vuelve a mirar cada 10 s hasta 30 s antes del límite y se va), si llega
   WM_ENDSESSION(FALSE), o si sigue viva 30 s después de WM_ENDSESSION(TRUE) (también en un segundo apagado; cada
   vigilancia lleva un número y la de los 75 s deja de valer), el apagado se canceló o es con
@@ -156,7 +156,12 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   (SharedReadAndWrite) se pide antes de GetCharacteristicsAsync, como Chrome. Las MELK reciben su saludo antes.
 - Sin emparejar, `FromBluetoothAddressAsync` da null si Windows no ha visto la tira hace poco (tras reiniciar):
   se escucha su anuncio unos segundos y se reintenta ("hubo que buscarla" en el registro).
-- `-probe` conecta y lee de la tira sin cambiar las luces (para comprobar la instalación), con hasta 30 s. Apunta a
+- `-probe` conecta y lee de la tira sin cambiar las luces (para comprobar la instalación), con hasta 30 s. Para
+  medir (1.1.10): `-wait N` espera hasta N s; `-fresh N` cierra todo y empieza de cero cada N s si no conectó;
+  `-scan` apunta además cuántos anuncios de la tira se oyeron (si no se anuncia, la tiene otro o está apagada);
+  `-hold N` guarda la conexión N s con MaintainConnection leyendo cada 30 s, y apunta caídas y tiempos. El 22-nov
+  por la tarde, con la 1.1.9, la tira no conectó en 30 s en 3 de 6 pruebas (16:52-16:58), anunciándose a -36 dBm y
+  sin ningún otro programa del PC conectado; antes (15:09-16:34) conectó siempre en 2-7 s. Apunta a
   los cuántos ms conectó Windows, cada intento y lo que tardó cada fase (buscar la tira, servicios, respuesta);
   encender y apagar también apuntan sus fases y cuándo conectó ("ya estaba conectada", "desde la conexión
   adelantada"). Para comparar: `-probe -scan` escucha anuncios a la vez (con la 1.1.4 no se notó) y
@@ -176,7 +181,7 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   ayudante válido, el inicio automático no se activa. La espera larga de /api/poll se corta si llega otra petición
   (que no sea otro /api/poll).
 - Versión: `LotusLED.ps1` e `Instalar.ps1` exigen LotusShutdown.exe 1.1.1 o más (la 1.0 tomaba cualquier argumento
-  por una MAC y apagaba las luces; la 1.1.0 no atendía el aviso para encender). La actual es la 1.1.9. Si no
+  por una MAC y apagaba las luces; la 1.1.0 no atendía el aviso para encender). La actual es la 1.1.10. Si no
   compila, `Instalar` no instala nada.
 - El ayudante se abre siempre fuera del job de quien lo abre (`Start-HelperDetached` en build.ps1, Instalar.ps1 y
   LotusLED.ps1, y `StartResidentHelper` en la tarea). Primero lo crea el servicio WMI (`Win32_Process.Create`; medido
@@ -193,7 +198,9 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   arrancar, el ayudante apunta en el registro si está en un job con más procesos o con KILL_ON_JOB_CLOSE
   (`JobWarning`; el job de un solo proceso no avisa; solo se mira el job más cercano). Si el mutex o los avisos son
   de un ayudante abierto como administrador, abrirlos da acceso denegado: se toma como que existe (antes, excepción); también en `Test-HelperArmed`, y un `-watch` nuevo lo apunta y se cierra
-  (antes, "Error inesperado"). A ese ayudante no se le pueden mandar avisos (encender, Restaura, Prepara). `Instalar` llama a
+  (antes, "Error inesperado"). A ese ayudante no se le podían mandar avisos (encender, Restaura, Prepara): desde la
+  1.1.10 el mutex y los avisos se crean dando permiso al usuario de la sesión (`NewEvent`/`NewMutex`), así que un
+  ayudante abierto como administrador también los atiende. `Instalar` llama a
   `build.ps1 -NoHelperRestart`; si no compila, `build.ps1` vuelve a abrir el de antes igualmente. Motivo: el 22-nov
   a las 05:05 el usuario apagó con el botón y el ayudante no dejó ni una línea; lo había abierto Instalar.ps1 desde
   Claude Code (Remote Control), así que estaba en el job de Claude y desapareció con Claude antes de que le llegara el
