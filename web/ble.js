@@ -397,6 +397,13 @@
       return ch.writeValueWithResponse ? ch.writeValueWithResponse(data) : ch.writeValue(data);
     }
 
+    /** Espera a que salgan los comandos pendientes (o a que pasen `ms`). Devuelve true si salieron todos. */
+    async flush(ms = 1500) {
+      const end = performance.now() + ms;
+      while ((this._busy || this._pending.size) && performance.now() < end) await sleep(20);
+      return !this._busy && !this._pending.size;
+    }
+
     // ------------------------------------------------------------ API de alto nivel
     power(on) { return this.send('power', Protocol.power(on, this.profile)); }
     color(r, g, b) { return this.send('color', Protocol.color(r, g, b, this.profile)); }

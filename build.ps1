@@ -1,5 +1,6 @@
 ﻿<#
-  Compila LotusLED.exe (app de escritorio) y LotusShutdown.exe (apaga las luces al apagar el PC).
+  Compila LotusLED.exe (app de escritorio) y LotusShutdown.exe (el ayudante sin ventana que enciende las luces
+  al iniciar Windows y las apaga al apagar el PC).
   Usa el compilador de C# que ya trae Windows (.NET Framework 4.x); no hace falta instalar nada.
   Funciona desde cualquier carpeta: todas las rutas son relativas a este script.
 #>
@@ -28,17 +29,31 @@ $refs = @(
 
 function Build($outName, [string[]]$files) {
     $out = Join-Path $here $outName
-    $cscArgs = @('/nologo', '/target:winexe', '/optimize+', '/platform:anycpu', "/out:$out", "/win32icon:$ico") + $refs + $files
+    # /codepage:65001: los .cs están en UTF-8 (sin esto, los acentos de los que no llevan BOM salen mal)
+    $cscArgs = @('/nologo', '/target:winexe', '/optimize+', '/platform:anycpu', '/codepage:65001', "/out:$out", "/win32icon:$ico") + $refs + $files
     & $csc $cscArgs
     if ($LASTEXITCODE -ne 0) { throw "Falló la compilación de $outName" }
     Write-Host "OK -> $outName" -ForegroundColor Green
 }
 
-# La app principal: todos los .cs menos el de apagado (cada uno tiene su propio Main)
+# El ayudante, por separado. Si está en marcha, Windows no deja sobrescribir el .exe: se cierra y luego se vuelve a abrir.
+$helper = Join-Path $here 'LotusShutdown.exe'
+$wasRunning = @(Get-Process -Name 'LotusShutdown' -ErrorAction SilentlyContinue)
+if ($wasRunning.Count -gt 0) {
+    $wasRunning | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+}
+try {
+    Build 'LotusShutdown.exe' @((Join-Path $srcDir 'LotusShutdown.cs'))
+} finally {
+    if ($wasRunning.Count -gt 0 -and (Test-Path $helper)) {
+        Start-Process -FilePath $helper -ArgumentList '-watch' -WorkingDirectory $here | Out-Null
+        Write-Host "El ayudante de las luces se ha vuelto a abrir." -ForegroundColor DarkGray
+    }
+}
+
+# La app nativa alternativa: todos los .cs menos el del ayudante (cada uno tiene su propio Main)
 $appFiles = Get-ChildItem "$srcDir\*.cs" | Where-Object { $_.Name -ne 'LotusShutdown.cs' } | ForEach-Object { $_.FullName }
 Build 'LotusLED.exe' $appFiles
-
-# El ayudante de apagado, por separado
-Build 'LotusShutdown.exe' @((Join-Path $srcDir 'LotusShutdown.cs'))
 
 Write-Host "`nCompilación completada." -ForegroundColor Cyan
