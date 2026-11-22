@@ -76,8 +76,8 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   que es lo que mira Chrome) y no conteste en 4 s (atascada: se pide otra). Según Microsoft, cancelar una petición
   no cancela la conexión, y cada petición sin respuesta caduca a los ~7 s (Unreachable): se vuelve a pedir. Lo mismo
   con las escrituras. Lo guardado (Cached, ya conectada) espera como mucho 4 s. Con el último Release se cierra todo
-  (la tira vuelve a anunciarse); si Windows ya avisó del apagado, se deja 3 s abierta por si la recoge el apagado (una
-  orden de encender cortada a medias no tira lo que llevaba conectado). Desde la 1.1.6 los servicios que ya no hacen
+  (la tira vuelve a anunciarse); si la suelta una orden de encender cortada por el aviso de Windows, se deja 3 s
+  abierta por si la recoge el apagado (no tira lo que llevaba conectado); al acabar el apagado se cierra ya. Desde la 1.1.6 los servicios que ya no hacen
   falta no se cierran al momento: los guarda el `Keeper` (`Hold`) y se cierran con la conexión, porque dos hilos
   pueden usar la tira a la vez (conexión adelantada y apagado) y Windows podría darles los mismos objetos.
 - Conexión adelantada: la tarea de respaldo (evento 1074, que salta en cuanto se pide apagar) ve que el ayudante
@@ -87,16 +87,19 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   Windows tardó 9 s en llegar a nosotros). El ayudante va conectando con las tiras mientras Windows cierra los demás
   programas (`Lights.Poke`: pide los servicios sin caché una y otra vez; para cuando empieza el apagado, que ya pide
   él), sin cambiar las luces, y ya conectadas pide MaintainConnection (se reintenta si no se pudo; la sesión se abre
-  sin el candado de la tira, para no hacer esperar al apagado); el apagado usa la misma conexión. Cada hilo suelta
-  su conexión él mismo y sus esperas se cortan al soltarla (`Lights.UseAbort`), así que no queda ninguna petición en
-  marcha. La suelta al acabar el apagado, si el apagado no sigue, al minuto si no empezó (otro aviso de la tarea
-  alarga el minuto), o si Windows deja de cerrar la sesión 3 s (otro programa lo canceló), y apunta cuándo conectó y
-  cuántas peticiones hicieron falta. Con la 1.1.3 no conectó en 9,1 s; con la 1.1.4, a los 13,3 s.
+  sin el candado de la tira, para no hacer esperar al apagado); el apagado usa la misma conexión. Si Windows aún no
+  encuentra la tira, se insiste. Cada hilo suelta su conexión él mismo, y sus esperas se cortan (`Lights.UseAbort`)
+  al soltarla o en cuanto empieza el apagado: desde ahí no pide nada a la tira (lo hace el apagado) y solo guarda la
+  conexión. La suelta al acabar el apagado, si el apagado no sigue, al minuto si no empezó y Windows no está cerrando
+  la sesión (otro aviso alarga el minuto), o si Windows deja de cerrar la sesión 3 s (otro programa lo canceló), y
+  apunta cuándo conectó y cuántas peticiones hicieron falta. Con la 1.1.3 no conectó en 9,1 s; con la 1.1.4, a los 13,3 s.
 - Opciones y MAC se leen antes (cada 5 s si cambian los archivos, o siempre si la última lectura de device.cfg
   falló) en `Snapshot`; device.cfg está en OneDrive, así
   que se guarda una copia en %LOCALAPPDATA%\LotusLED\ultimas-tiras.cfg que solo se usa si no se puede leer.
 - Encender nunca llega después de apagar: el aviso de Windows activa `Lights.Abort` (corta al momento las esperas
-  de las órdenes de encender) y el apagado se queda `Lights.Gate` hasta el final (lo espera hasta 4 s). El apagado
+  de las órdenes de encender) y el apagado se queda `Lights.Gate` hasta el final (lo espera hasta 4 s; si no lo
+  consiguió, en cuanto la orden de encender lo suelta vuelve a apagar las que ya había apagado). Si el
+  apagado no sigue, sus esperas se cortan (`OffRound.CancelEvent`), para que no apague segundos después. El apagado
   apunta en el registro desde otro hilo, para no esperar al disco antes de la primera orden.
 - ENDSESSION_CLOSEAPP con LOGOFF es un cierre de sesión, no un instalador.
 - WM_ENDSESSION(FALSE), o seguir vivo 30 s después de WM_ENDSESSION(TRUE) (o 52,5 s después de la pregunta sin
@@ -115,14 +118,18 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   que a un proceso nacido a mitad del apagado le llegue la pregunta) con ventana oculta, nivel 0x100 y motivo.
   No se queda el mutex del ayudante. Como empieza antes, puede insistir hasta 25 s (pero en WM_ENDSESSION retiene
   como el ayudante). Cuando llega WM_QUERYENDSESSION (o WM_ENDSESSION sin pregunta, `TaskAsked`): si aquel apagado
-  acabó sin llegar a todas, lo intenta otra vez con 20 s, como el ayudante (Windows ya nos espera); si aún está
-  apagando, se le alarga el tiempo a 20 s desde ese momento (`OffRound.Deadline`, que SetAll mira en cada intento).
+  acabó (o ya dejó de insistir, `OffRound.Finishing`) sin llegar a todas, lo intenta otra vez con 20 s, como el ayudante (Windows ya nos espera); si aún está
+  apagando, se le alarga el tiempo a 20 s desde ese momento (`OffRound.Deadline`, que SetAll mira en cada intento;
+  si SetAll ya se había rendido, el apagado vuelve a intentarlo con las que faltan mientras quede tiempo).
   El aviso de que acabó un apagado anterior no quita el motivo del que está en marcha. La tarea tiene un límite de
-  4 min; volver a encender se recorta para acabar 20 s antes. Luego se queda: a los 75 s, si Windows no se está
-  apagando (SM_SHUTTINGDOWN; si sí, mira otras dos veces cada 10 s y se va), si llega WM_ENDSESSION(FALSE), o si
-  sigue viva 30 s después de WM_ENDSESSION(TRUE) (también en un segundo apagado), el apagado se canceló o es con
+  4 min; volver a encender se recorta para acabar 30 s antes (si no queda tiempo, el ayudante que deja lo abre
+  con `-watch -on` y las enciende él). Luego se queda: a los 75 s, si Windows no se está
+  apagando (SM_SHUTTINGDOWN; si sí, vuelve a mirar cada 10 s hasta 30 s antes del límite y se va), si llega
+  WM_ENDSESSION(FALSE), o si sigue viva 30 s después de WM_ENDSESSION(TRUE) (también en un segundo apagado; cada
+  vigilancia lleva un número y la de los 75 s deja de valer), el apagado se canceló o es con
   espera (`/t 600`): vuelve a encender si LightsOn, deja un ayudante `-watch` en marcha (por el Explorador, ver
-  abajo) y termina (`WM_APP_TASKDONE`, que no se va si entretanto empezó otro apagado). Si mientras tanto empieza
+  abajo) y termina (`WM_APP_TASKDONE`, que no se va si entretanto empezó otro apagado, ni si es de una vuelta
+  anterior: lleva número). Si mientras tanto empieza
   otro apagado, vuelve a apagar. Sin nada que apagar (sin MAC) termina al momento. Antes la tarea moría a medias
   (0xC000013A el 1-nov) o ni arrancaba (15 y 21-nov).
 - `LotusLED.ps1` solo deja de apagar desde la web si existe `Local\LotusLED_Ayudante_Apaga`, que el ayudante tiene
@@ -157,12 +164,18 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
 - Versión: `LotusLED.ps1` e `Instalar.ps1` exigen LotusShutdown.exe 1.1.1 o más (la 1.0 tomaba cualquier argumento
   por una MAC y apagaba las luces; la 1.1.0 no atendía el aviso para encender). La actual es la 1.1.6. Si no
   compila, `Instalar` no instala nada.
-- El ayudante se abre siempre a través del Explorador, con un acceso en %LOCALAPPDATA%\LotusLED (`Ayudante.lnk`,
-  o `Ayudante (encender).lnk` con `-on`), como lo abre Windows desde Inicio: `Start-HelperDetached` en build.ps1,
-  Instalar.ps1 y LotusLED.ps1, y `StartViaExplorer` en la tarea. Si no aparece el mutex en 3-5 s, se abre
-  directamente. Motivo: el 22-nov a las 05:05 el usuario apagó con el botón y el ayudante no dejó ni una línea; lo
-  había abierto Instalar.ps1 desde Claude Code (Remote Control), así que estaba en el job de Claude (app MSIX) y
-  desapareció con Claude antes de que le llegara el aviso. El que abre Windows desde Inicio no está en ningún job.
+- El ayudante se abre siempre a través del Explorador, con un acceso directo junto al .exe (`Ayudante.lnk`, o
+  `Ayudante (encender).lnk` con `-on`; si no se puede guardar ahí, en %LOCALAPPDATA%\LotusLED), como lo abre Windows
+  desde Inicio: `Start-HelperDetached` en build.ps1, Instalar.ps1 y LotusLED.ps1, y `StartViaExplorer` en la tarea.
+  No en AppData: lo que crea allí una app empaquetada (MSIX, como Claude) Windows puede guardarlo en otro sitio
+  (LocalCache del paquete), y el Explorador no lo vería. Si ya hay uno no se abre otro (con `-on` se le manda el
+  aviso de encender). Si el mutex no aparece en 10 s (20 s si ya hay un `-watch` arrancando en la sesión), lo crea
+  el servicio WMI (`Win32_Process.Create`, también fuera del job), y si tampoco, se abre directamente (solo si no
+  hay ninguno arrancando). Al arrancar, el ayudante apunta en el registro si está dentro de un job
+  (`IsProcessInJob`). `Instalar` llama a `build.ps1 -NoHelperRestart`. Motivo: el 22-nov a las 05:05 el usuario
+  apagó con el botón y el ayudante no dejó ni una línea; lo había abierto Instalar.ps1 desde Claude Code (Remote
+  Control), así que estaba en el job de Claude (app MSIX) y desapareció con Claude antes de que le llegara el aviso.
+  El que abre Windows desde Inicio no está en ningún job.
 - `build.ps1` cierra solo el ayudante de esta carpeta (misma ruta del .exe) antes de compilar (si no, el .exe está
   bloqueado) y lo vuelve a abrir. Usa /codepage:65001 porque MainForm.cs, BleManager.cs y Program.cs no llevan BOM
   y tienen acentos.

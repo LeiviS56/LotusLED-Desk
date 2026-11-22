@@ -10,6 +10,8 @@ $links = @(
     (Join-Path ([Environment]::GetFolderPath('Programs')) 'LotusLED Desk.lnk'),
     (Join-Path $startup 'LotusLED Luces.lnk'),
     (Join-Path $startup 'LotusLED.lnk'),
+    (Join-Path $dir 'Ayudante.lnk'),
+    (Join-Path $dir 'Ayudante (encender).lnk'),
     (Join-Path $env:LOCALAPPDATA 'LotusLED\Ayudante.lnk'),
     (Join-Path $env:LOCALAPPDATA 'LotusLED\Ayudante (encender).lnk')
 )
