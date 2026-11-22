@@ -61,8 +61,7 @@ LotusShutdown.exe ─► ayudante sin ventana que arranca con Windows: enciende 
 
 LotusLED.ps1 ──► servidor local http://localhost:8787 ──► ventana Edge/Chrome (modo app)
      │                                                        │
-     ├─ icono en la bandeja del sistema                       └─ web/ (interfaz + Web Bluetooth → tira LED)
-     └─ al apagar Windows avisa a la interfaz para que pare la música o el ambilight
+     └─ icono en la bandeja del sistema                       └─ web/ (interfaz + Web Bluetooth → tira LED)
 
 LotusLED.exe      ─► versión alternativa 100% nativa (WinForms + Bluetooth de WinRT)
 ```
@@ -70,7 +69,7 @@ LotusLED.exe      ─► versión alternativa 100% nativa (WinForms + Bluetooth 
 | Carpeta / archivo | Qué hace |
 |---|---|
 | `web/` | Interfaz (HTML/CSS/JS): `ble.js` protocolo Bluetooth, `sync.js` música y ambilight, `app.js` lógica |
-| `LotusLED.ps1` | Lanzador: servidor local, bandeja del sistema y aviso de apagado |
+| `LotusLED.ps1` | Lanzador: servidor local y bandeja del sistema |
 | `src/` | Código C# de la versión nativa (`LotusLED.exe`) y del ayudante `LotusShutdown.exe` |
 | `build.ps1` | Compila los dos `.exe` con el compilador que ya trae Windows |
 | `Instalar.ps1` / `Desinstalar.ps1` | Accesos directos, el ayudante al iniciar Windows y una tarea de respaldo |
@@ -95,6 +94,9 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 Lo que hace queda apuntado en `%LOCALAPPDATA%\LotusLED\LotusShutdown.log`: ahí se ve si la orden llegó
 al apagar y cuánto tardó.
+
+Lo que no cubre: suspender o hibernar el PC (Windows no avisa a los programas; si el botón de encendido está
+puesto en "suspender", tampoco) y los cortes de luz.
 
 ## Protocolo (para curiosos)
 

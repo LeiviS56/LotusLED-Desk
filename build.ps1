@@ -38,7 +38,12 @@ function Build($outName, [string[]]$files) {
 
 # El ayudante, por separado. Si está en marcha, Windows no deja sobrescribir el .exe: se cierra y luego se vuelve a abrir.
 $helper = Join-Path $here 'LotusShutdown.exe'
-$wasRunning = @(Get-Process -Name 'LotusShutdown' -ErrorAction SilentlyContinue)
+# Solo el de esta carpeta (el que bloquea el .exe); si estaba vigilando, luego se vuelve a abrir
+$wasRunning = @(Get-Process -Name 'LotusShutdown' -ErrorAction SilentlyContinue | Where-Object {
+    $p = $null
+    try { $p = $_.Path } catch {}
+    -not $p -or $p -eq $helper
+})
 if ($wasRunning.Count -gt 0) {
     $wasRunning | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 500

@@ -262,6 +262,8 @@
     applyIntensity();
     updateSceneMode();
     save();
+    // El ayudante sin ventana tiene que saber si estaban encendidas (por si se cancela un apagado)
+    reportBackendState();
   }
 
   function setColor(rgb, from = null) {
@@ -813,7 +815,14 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ enabled: e.target.checked }),
           });
-          if (res.ok) {
+          const data = res.ok ? await res.json().catch(() => ({})) : {};
+          if (data.ok === false) {
+            // Sin el ayudante (LotusShutdown.exe) no se puede: abrir la ventana al iniciar Windows no es una opción
+            e.target.checked = !!data.autostart;
+            state.autostart = !!data.autostart;
+            save();
+            toast(data.error || 'No se pudo activar el inicio automático.', 'warn', 7000);
+          } else if (res.ok) {
             toast(e.target.checked ? 'Al iniciar Windows se encenderán las luces, sin abrir la ventana' : 'Inicio automático desactivado', 'ok');
           }
         } catch {

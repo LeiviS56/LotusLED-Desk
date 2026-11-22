@@ -55,27 +55,53 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   (título "LotusLED Desk", sin WS_VISIBLE; HWND_MESSAGE no serviría). Windows apaga proceso por proceso
   (QUERY → END → lo termina → el siguiente), de mayor a menor nivel. El ayudante usa nivel 0x100 (de los últimos):
   si otro programa cancela antes, ni se entera y las luces siguen encendidas, y para entonces el navegador ya se
-  cerró, así que su apagado es la última orden. En WM_QUERYENDSESSION pone el motivo ("Apagando las luces LED…";
-  sin motivo, a un programa sin ventana visible Windows lo mata a los 5 s), lanza el apagado en otro hilo y
-  responde al momento (en un apagado forzado la pregunta solo tiene 1 s); en WM_ENDSESSION espera (máx. ~6,5 s).
-  WM_ENDSESSION(FALSE) = cancelado mientras esperábamos → vuelve a encender si las luces estaban encendidas.
-  Con `-on`, al arrancar enciende las tiras (insiste hasta 3 min, la tira puede tardar en arrancar).
+  cerró (Chrome está en 0x280 y se mata a sí mismo en su WM_ENDSESSION), así que su apagado es la última orden.
+- En WM_QUERYENDSESSION no se toca el disco: se pone el motivo ("Apagando las luces LED…"; sin motivo, a un
+  programa sin ventana visible Windows lo mata a los 5 s), se lanza el apagado en otro hilo y se responde al
+  momento (en un apagado forzado la pregunta solo tiene 1 s; `shutdown /s` sin `/t 0` ya es forzado). En
+  WM_ENDSESSION se espera, como mucho 7,3 s contados desde la pregunta (presupuesto del apagado: 6 s). Si dura más
+  de 5 s, Windows enseña su pantalla de espera unos segundos y sigue solo.
+- Opciones y MAC se leen antes (cada 5 s si cambian los archivos) en `Snapshot`; device.cfg está en OneDrive, así
+  que se guarda una copia en %LOCALAPPDATA%\LotusLED\ultimas-tiras.cfg que solo se usa si no se puede leer.
+- Encender nunca llega después de apagar: el aviso de Windows activa `Lights.Abort` (corta al momento las esperas
+  de las órdenes de encender) y el apagado se queda `Lights.Gate` hasta el final.
+- WM_ENDSESSION(FALSE), o seguir vivo 30 s después de WM_ENDSESSION(TRUE), es que el apagado no siguió: vuelve a
+  encender si LightsOn (la web lo actualiza en cada encendido/apagado). En la práctica casi nunca pasa.
+- Con `-on`, al arrancar enciende las tiras (insiste hasta 3 min, la tira puede tardar en arrancar). Si ya hay un
+  ayudante en marcha, el nuevo con `-on` se lo pide con el evento `Local\LotusLED_Ayudante_Encender` y termina.
+- `RegisterApplicationRestart("-watch")`: si Restart Manager (un instalador) lo cierra, Windows lo vuelve a abrir.
+- `-task` (tarea de respaldo, evento 1074): si no hay ayudante, hace lo mismo que él (ventana oculta, nivel 0x100,
+  motivo) y termina al acabar. Antes la tarea moría a medias (0xC000013A el 1-nov) o ni arrancaba (15 y 21-nov).
+- Escritura: la primera puede esperar a que Windows conecte (lo guardado con Cached no conecta), así que tiene casi
+  todo el tiempo. Sin respuesta (FFF3 de la ELK-BLEDDM): dos tramas y una lectura sin caché de FFF3; si la lectura
+  no vuelve o da Unreachable, se reintenta. Si un intento falla, el siguiente busca sin caché. OpenAsync
+  (SharedReadAndWrite) se pide antes de GetCharacteristicsAsync, como Chrome. Las MELK reciben su saludo antes.
 - Sin emparejar, `FromBluetoothAddressAsync` da null si Windows no ha visto la tira hace poco (tras reiniciar):
-  se escucha su anuncio unos segundos y se reintenta. Con la tira ausente, cada intento tarda 7 s y no se cancela.
+  se escucha su anuncio unos segundos y se reintenta ("hubo que buscarla" en el registro). Con la tira ausente,
+  cada intento tarda 7 s y no se cancela.
+- `-probe` conecta y lee de la tira sin cambiar las luces (para comprobar la instalación).
 - Opciones del ayudante en %LOCALAPPDATA%\LotusLED\auto.cfg (PowerOnStart, PowerOffShutdown, LightsOn), que
   escribe `LotusLED.ps1` con lo que manda la web (/api/state) y también `AppSettings.Save` del exe nativo.
 - Registro: %LOCALAPPDATA%\LotusLED\LotusShutdown.log (cada arranque, encendido y apagado, con tiempos).
 - Qué tiras: argumentos + `device.cfg` (junto al exe o en %LOCALAPPDATA%\LotusLED). settings.cfg (LastAddress) solo
-  si no hay device.cfg, porque puede ser la tira del vecino. `Instalar` busca tiras (`-find`) si no hay ninguna.
+  si no hay device.cfg, porque puede ser la tira del vecino. `Instalar` busca tiras (`-find`) si no hay device.cfg.
 - Windows comparte la conexión BLE entre programas: el ayudante puede escribir aunque la web tenga la tira conectada.
   No guardar conexiones abiertas entre apagados (la tira dejaría de anunciarse).
-- `build.ps1` cierra el ayudante antes de compilar (si no, el .exe está bloqueado) y lo vuelve a abrir.
-  Usa /codepage:65001 porque MainForm.cs, BleManager.cs y Program.cs no llevan BOM y tienen acentos.
+- `LotusLED.ps1`: con el ayudante en marcha, su aviso SessionEnding no hace nada (apagar desde la web dejaría la tira
+  apagada aunque luego se cancelara el apagado). Nunca abre la ventana al iniciar Windows: sin ayudante válido, el
+  inicio automático no se activa. La espera larga de /api/poll se corta si llega otra petición.
+- Versión: `LotusLED.ps1` e `Instalar.ps1` exigen LotusShutdown.exe 1.1 o más (la 1.0 tomaba cualquier argumento por
+  una MAC y apagaba las luces). Si no compila, `Instalar` no instala nada.
+- `build.ps1` cierra el ayudante de esta carpeta antes de compilar (si no, el .exe está bloqueado) y lo vuelve a
+  abrir. Usa /codepage:65001 porque MainForm.cs, BleManager.cs y Program.cs no llevan BOM y tienen acentos.
+- Instalado en el PC del usuario el 22-nov (rama local suya con el rediseño estilo Apple, sin subir): la prueba
+  `-probe` llegó a la tira en 4,4 s.
 
 ## Pendiente
-1. En el PC del usuario: `git pull`, ejecutar `Instalar.bat` (compila y deja el ayudante en marcha).
-2. Probar de verdad: reiniciar y apagar, y mirar LotusShutdown.log.
-3. Subir los .exe nuevos a una Release de GitHub (v1.1).
+1. Probar de verdad: apagar y encender el PC, y mirar LotusShutdown.log (tiempos del apagado, "hubo que buscarla").
+2. Subir los .exe nuevos a una Release de GitHub (v1.1). La Release v1.0 tiene el LotusShutdown.exe antiguo.
+3. No cubierto: suspender o hibernar (Windows no avisa a los programas), apagar con el botón si está puesto en
+   "suspender", cortes de luz.
 
 ## Notas
 - Sin dependencias externas: ni NuGet ni Node; solo lo que trae Windows.

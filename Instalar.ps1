@@ -29,24 +29,43 @@ function New-Shortcut($path, $target, [string]$arguments, [string]$desc, [int]$s
 
 Write-Output "Instalando LotusLED Desk desde: $dir`n"
 
-# 1. El ayudante: se compila si falta o si el código es más nuevo que el .exe
+# El ayudante tiene que ser la versión 1.1 o más: la 1.0 tomaba cualquier argumento por una MAC y apagaba las
+# luces, así que con ella en Inicio las luces se apagarían al iniciar Windows.
+function Test-HelperOk {
+    if (-not (Test-Path $helper)) { return $false }
+    try {
+        $v = [Version](Get-Item $helper).VersionInfo.FileVersion
+        return ($v -ge [Version]'1.1.0.0')
+    } catch { return $false }
+}
+
+# 1. El ayudante: se compila si falta, si es de una versión antigua o si el código es más nuevo que el .exe
 $src = Join-Path $dir 'src\LotusShutdown.cs'
-$needBuild = -not (Test-Path $helper)
+$needBuild = -not (Test-HelperOk)
 if (-not $needBuild -and (Test-Path $src)) {
     $needBuild = (Get-Item $src).LastWriteTime -gt (Get-Item $helper).LastWriteTime
 }
 if ($needBuild) {
     Write-Output "Compilando los .exe (build.ps1)..."
+    $buildError = $null
     try {
         & (Join-Path $dir 'build.ps1')
     } catch {
-        Write-Output "  No se pudo compilar: $($_.Exception.Message)"
+        $buildError = $_.Exception.Message
+        Write-Output "  No se pudo compilar: $buildError"
     }
     Write-Output ""
+    # Si no compiló, el .exe que haya es el de antes (puede ser el antiguo): mejor no instalar nada
+    if ($buildError -and (Test-Path $src) -and (Test-Path $helper) -and
+        (Get-Item $src).LastWriteTime -gt (Get-Item $helper).LastWriteTime) {
+        Write-Output "No se instaló nada: LotusShutdown.exe no se pudo compilar y el que hay es de una versión anterior."
+        Write-Output "Mira el error de arriba, arréglalo y vuelve a ejecutar Instalar.bat."
+        exit 1
+    }
 }
-if (-not (Test-Path $helper)) {
-    Write-Output "Falta LotusShutdown.exe, así que las luces no se encenderán ni apagarán solas."
-    Write-Output "Descárgalo de la página Releases de GitHub o ejecuta build.ps1, y vuelve a ejecutar Instalar.bat."
+if (-not (Test-HelperOk)) {
+    Write-Output "Falta LotusShutdown.exe (o es de una versión antigua), así que las luces no se encenderán ni apagarán solas."
+    Write-Output "No se instaló nada. Ejecuta build.ps1, mira si da algún error y vuelve a ejecutar Instalar.bat."
     exit 1
 }
 
@@ -61,12 +80,7 @@ function Get-KnownMacs {
             }
         }
     }
-    $settings = Join-Path $dataDir 'settings.cfg'
-    if (Test-Path $settings) {
-        foreach ($l in Get-Content $settings) {
-            if ($l -match '^LastAddress=(\d+)$' -and $Matches[1] -ne '0') { $macs += $Matches[1] }
-        }
-    }
+    # La última tira de LotusLED.exe (settings.cfg) no cuenta: puede ser la de un vecino (ya pasó con una L7179)
     return $macs
 }
 
@@ -137,7 +151,11 @@ try {
 
 # 6. Arrancar el ayudante ya (cerrando uno anterior, por si era de otra versión o de otra carpeta).
 #    Sin -on: instalar no cambia las luces; se encenderán solas la próxima vez que inicies Windows.
-Get-Process -Name 'LotusShutdown' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process -Name 'LotusShutdown' -ErrorAction SilentlyContinue | Where-Object {
+    # Uno que esté buscando tiras o comprobándolas (-find, -probe) se deja terminar
+    $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction SilentlyContinue).CommandLine
+    -not $cmd -or $cmd -match '-watch|-task'
+} | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
 Start-Process -FilePath $helper -ArgumentList '-watch' -WorkingDirectory $dir | Out-Null
 
