@@ -93,14 +93,25 @@ function Test-AutostartIsHelper {
 # Si ya hay uno en marcha no se abre otro. Con -on se le pide que encienda, también si el que queda en marcha es otro
 # que se abrió a la vez.
 function Start-HelperDetached([string]$Exe, [string]$Arguments, [string]$Dir) {
+    # Si su mutex existe (si es de uno abierto como administrador no se puede abrir, pero existe)
     $isUp = {
         $mm = $null
-        if ([System.Threading.Mutex]::TryOpenExisting('Local\LotusLED_Ayudante_Luces', [ref]$mm)) { $mm.Dispose(); $true } else { $false }
+        try {
+            if ([System.Threading.Mutex]::TryOpenExisting('Local\LotusLED_Ayudante_Luces', [ref]$mm)) { $mm.Dispose(); $true } else { $false }
+        } catch { $true }
     }
+    # Con -on, el aviso de encender: sus avisos existen antes que su mutex; se espera hasta 20 s por si aún arranca
     $askOn = {
         if ($Arguments -match '-on') {
-            $e = $null
-            if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\LotusLED_Ayudante_Encender', [ref]$e)) { [void]$e.Set(); $e.Dispose() }
+            for ($i = 0; $i -lt 200; $i++) {
+                $e = $null
+                try {
+                    if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\LotusLED_Ayudante_Encender', [ref]$e)) {
+                        [void]$e.Set(); $e.Dispose(); break
+                    }
+                } catch { break }
+                Start-Sleep -Milliseconds 100
+            }
         }
     }
     if (& $isUp) { & $askOn; return }
@@ -166,7 +177,9 @@ function Start-HelperDetached([string]$Exe, [string]$Arguments, [string]$Dir) {
     if (-not $up -and -not (& $starting)) {
         Start-Process -FilePath $Exe -ArgumentList $Arguments -WorkingDirectory $Dir | Out-Null
     }
-    if ($up) { & $askOn }
+    # También si el que queda en marcha es otro que se abrió a la vez sin -on (si es el nuestro, no enciende dos veces
+    # a la vez: lo junta con lo que ya está haciendo)
+    & $askOn
 }
 
 function Start-Helper([switch]$PowerOn) {

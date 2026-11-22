@@ -44,8 +44,8 @@ using Windows.Storage.Streams;
 [assembly: AssemblyTitle("LotusLED Desk - luces")]
 [assembly: AssemblyDescription("Enciende las tiras LED al iniciar Windows y las apaga al apagar el PC")]
 [assembly: AssemblyProduct("LotusLED Desk")]
-[assembly: AssemblyVersion("1.1.7.0")]
-[assembly: AssemblyFileVersion("1.1.7.0")]
+[assembly: AssemblyVersion("1.1.8.0")]
+[assembly: AssemblyFileVersion("1.1.8.0")]
 
 namespace LotusLED.Shutdown
 {
@@ -113,10 +113,14 @@ namespace LotusLED.Shutdown
         /// </summary>
         static int RunTask(List<string> macs)
         {
-            Mutex m;
-            if (Mutex.TryOpenExisting(MutexName, out m))
+            Mutex m = null;
+            bool helperUp;
+            // Si es de un ayudante abierto como administrador no se puede abrir, pero existe: se encarga él
+            try { helperUp = Mutex.TryOpenExisting(MutexName, out m); }
+            catch (UnauthorizedAccessException) { helperUp = true; }
+            if (helperUp)
             {
-                m.Dispose();
+                if (m != null) m.Dispose();
                 try
                 {
                     EventWaitHandle prepare;
@@ -183,7 +187,7 @@ namespace LotusLED.Shutdown
         // "shutdown /t 600"). Si pasado este rato Windows no nos ha cerrado ni se está apagando, vuelve a encender y
         // deja el ayudante en marcha. Por debajo del límite de 4 min de la tarea, contando lo que tarda en encender.
         const int TaskStayMs = 75000;
-        const int TaskRecheckMs = 10000;    // si a los 75 s Windows aún se está apagando, se vuelve a mirar (2 veces)
+        const int TaskRecheckMs = 10000;    // si Windows aún está cerrando la sesión, se vuelve a mirar cada 10 s
         const int StartWindowMs = 180000;   // al iniciar sesión, cuánto tiempo seguimos intentando encender
         const int PowerOnTryMs = 45000;     // cada intento de encender al iniciar sesión
         const int ResumeCheckMs = 30000;    // si seguimos vivos tanto después de WM_ENDSESSION, el apagado se canceló
@@ -211,13 +215,15 @@ namespace LotusLED.Shutdown
         static volatile OffRound _round;        // el apagado en curso (solo se cambia desde el hilo de la ventana)
         static int _roundCount;                 // para saber de qué apagado habla un aviso que llega tarde
         static bool _reason;                    // hay motivo de bloqueo puesto
-        static int _powerOnRunning;             // 1 mientras se intenta encender
+        static readonly object _powerOnLock = new object();
+        static bool _powerOnBusy, _askLogon, _askRestore;   // encender: si ya se está atendiendo, y qué se ha pedido
         static string _stamp;                   // huella de los archivos de configuración de la última lectura
         static EventWaitHandle _armed;          // abierto mientras hay tiras que apagar (lo mira LotusLED.ps1)
         static volatile int _exitCode;          // de la tarea de respaldo: 0 si apagó todas (o no tenía que apagar)
         static bool _taskResumed;               // tarea de respaldo: el apagado no siguió y ya se volvió a encender
         static int _taskCheckGen;               // tarea de respaldo: qué vigilancia vale (los avisos de otra se ignoran)
         static int _resumeGen;                  // tarea de respaldo: qué vuelta a la normalidad vale para irse
+        static bool _handedOff;                 // tarea de respaldo: ya dejó un ayudante antes de su límite de 4 min
         static readonly Stopwatch _age = Stopwatch.StartNew();  // desde que arrancó el proceso (la tarea tiene 4 min)
         static EventWaitHandle _prepareEvent;   // la tarea de respaldo avisa de que se pidió apagar (ir conectando)
         static volatile bool _prepareBySystem;  // el aviso para ir conectando es porque Windows empezó a cerrar la sesión
@@ -375,72 +381,106 @@ namespace LotusLED.Shutdown
         }
 
         /// <summary>
-        /// Al iniciar sesión: encender las tiras. La tira puede tardar en arrancar, así que se insiste un rato. En cada
-        /// intento se miran las tiras y las opciones de ese momento (pueden cambiar mientras tanto, o faltar la MAC
-        /// al principio); un aviso para encender que llegue a mitad se suma a este intento.
+        /// Encender las tiras: al iniciar sesión (si PowerOnStart) o porque lo pide la tarea tras un apagado cancelado
+        /// (restore: si estaban encendidas, LightsOn). Una petición que llega mientras se atiende otra no se pierde: la
+        /// que está en marcha vuelve a empezar con las dos y con todas las tiras.
         /// </summary>
-        /// <param name="restore">Lo pide la tarea tras un apagado cancelado: se encienden si estaban encendidas (LightsOn).</param>
         static void PowerOnAtStart(bool restore = false)
         {
-            if (Interlocked.Exchange(ref _powerOnRunning, 1) == 1) return; // ya se está intentando (con lo de ahora)
+            lock (_powerOnLock)
+            {
+                if (restore) _askRestore = true; else _askLogon = true;
+                if (_powerOnBusy) return;
+                _powerOnBusy = true;
+            }
+            bool clean = false;
             try
             {
-                var clock = Stopwatch.StartNew();
-                var done = new List<ulong>();
-                var pending = new List<ulong>();
-                // Mientras Windows cierra la sesión no sale ninguna orden de encender (un ayudante abierto a mitad de un
-                // apagado puede no recibir la pregunta, y encendería detrás del apagado): se espera, sin contar ese rato.
-                // Si el apagado sigue, termina (la pregunta, _ending, o Windows nos cierra); si se cancela, sigue.
-                Func<bool> stop = () => _ending || ShuttingDown();
-                bool loggedNoMac = false, loggedPause = false;
-                int tries = 0;
-                long paused = 0;
-                while (!_ending && clock.ElapsedMilliseconds - paused < StartWindowMs)
+                while (true)
                 {
-                    if (ShuttingDown())
+                    bool logon, again;
+                    lock (_powerOnLock)
                     {
-                        if (!loggedPause) { Log.Write("Encender: espero, Windows está cerrando la sesión."); loggedPause = true; }
-                        var wait = Stopwatch.StartNew();
-                        while (ShuttingDown() && !_ending) Thread.Sleep(500);
-                        paused += wait.ElapsedMilliseconds;
-                        continue;
+                        logon = _askLogon;
+                        again = _askRestore;
+                        _askLogon = _askRestore = false;
+                        if (!logon && !again) { _powerOnBusy = false; clean = true; return; }
                     }
-                    var cfg = _cfg;
-                    if (cfg == null || !(restore ? cfg.LightsOn : cfg.PowerOnStart))
-                    {
-                        if (done.Count == 0)
-                            Log.Write(restore ? "Volver a encender: las luces estaban apagadas." : "Encender al iniciar está desactivado en la interfaz.");
-                        return;
-                    }
-                    pending.Clear();
-                    foreach (var a in cfg.Addrs) if (!done.Contains(a)) pending.Add(a);
-                    if (pending.Count == 0)
-                    {
-                        if (done.Count > 0) break; // todas encendidas
-                        // Todavía no hay ninguna MAC (device.cfg sin leer o vacío): se espera a que aparezca
-                        if (!loggedNoMac) { Log.Write("Encender al iniciar: espero a que haya alguna MAC en device.cfg."); loggedNoMac = true; }
-                        for (int i = 0; i < 50 && !_ending; i++) Thread.Sleep(100);
-                        continue;
-                    }
-                    tries++;
-                    // Cada intento con tiempo de sobra: conectar puede tardar, y cortar a medias obliga a empezar de cero
-                    var res = Lights.SetAll(pending, true, PowerOnTryMs, stop, true);
-                    if (_ending) break; // Windows se apaga: lo que pase con estas órdenes ya no cuenta
-                    bool first = done.Count == 0;
-                    foreach (var r in res.Values)
-                        if (r.Ok) { done.Add(r.Address); pending.Remove(r.Address); }
-                    // En cuanto se enciende la primera (no al final: la web puede apagarlas mientras se insiste con otra)
-                    if (first && done.Count > 0) NoteLightsOn();
-                    if (tries == 1 || pending.Count == 0)
-                        Log.Results((restore ? "Volver a encender" : "Encender al iniciar") + " (intento " + tries + ")", res);
-                    if (pending.Count == 0) continue; // por si entretanto apareció otra tira; si no, termina arriba
-                    for (int i = 0; i < 50 && !_ending; i++) Thread.Sleep(100);
+                    PowerOnRun(logon, again);
                 }
-                if (pending.Count > 0 && !_ending)
-                    Log.Write("No se pudo encender " + Log.List(pending) + " en " + (StartWindowMs / 1000) +
-                              " s. ¿Está enchufada, o conectada al móvil?");
             }
-            finally { Interlocked.Exchange(ref _powerOnRunning, 0); }
+            finally
+            {
+                if (!clean) lock (_powerOnLock) { _powerOnBusy = false; }
+            }
+        }
+
+        static bool PowerOnAsked { get { lock (_powerOnLock) return _askLogon || _askRestore; } }
+
+        /// <summary>
+        /// La tira puede tardar en arrancar, así que se insiste un rato. En cada intento se miran las tiras y las
+        /// opciones de ese momento (pueden cambiar mientras tanto, o faltar la MAC al principio).
+        /// </summary>
+        static void PowerOnRun(bool logon, bool restore)
+        {
+            string what = logon ? "Encender al iniciar" : "Volver a encender";
+            var clock = Stopwatch.StartNew();
+            var done = new List<ulong>();
+            var pending = new List<ulong>();
+            // Mientras Windows cierra la sesión no sale ninguna orden de encender (un ayudante abierto a mitad de un
+            // apagado puede no recibir la pregunta, y encendería detrás del apagado): se espera, sin contar ese rato.
+            // Si el apagado sigue, termina (la pregunta, _ending, o Windows nos cierra); si se cancela, sigue.
+            Func<bool> stop = () => _ending || ShuttingDown();
+            bool loggedNoMac = false, loggedPause = false;
+            int tries = 0;
+            long paused = 0;
+            while (!_ending && clock.ElapsedMilliseconds - paused < StartWindowMs)
+            {
+                if (PowerOnAsked) return; // otra petición: se vuelve a empezar con las dos
+                var cfg = _cfg;
+                if (cfg == null || !((logon && cfg.PowerOnStart) || (restore && cfg.LightsOn)))
+                {
+                    if (done.Count == 0)
+                        Log.Write(logon && !restore ? "Encender al iniciar está desactivado en la interfaz."
+                                                    : "Volver a encender: las luces estaban apagadas.");
+                    return;
+                }
+                if (ShuttingDown())
+                {
+                    if (!loggedPause) { Log.Write(what + ": espero, Windows está cerrando la sesión."); loggedPause = true; }
+                    var wait = Stopwatch.StartNew();
+                    while (ShuttingDown() && !_ending && !PowerOnAsked) Thread.Sleep(500);
+                    paused += wait.ElapsedMilliseconds;
+                    continue;
+                }
+                pending.Clear();
+                foreach (var a in cfg.Addrs) if (!done.Contains(a)) pending.Add(a);
+                if (pending.Count == 0)
+                {
+                    if (done.Count > 0) break; // todas encendidas
+                    // Todavía no hay ninguna MAC (device.cfg sin leer o vacío): se espera a que aparezca
+                    if (!loggedNoMac) { Log.Write(what + ": espero a que haya alguna MAC en device.cfg."); loggedNoMac = true; }
+                    for (int i = 0; i < 50 && !_ending && !ShuttingDown() && !PowerOnAsked; i++) Thread.Sleep(100);
+                    continue;
+                }
+                tries++;
+                // Cada intento con tiempo de sobra: conectar puede tardar, y cortar a medias obliga a empezar de cero
+                var res = Lights.SetAll(pending, true, PowerOnTryMs, stop, true);
+                if (_ending) break; // Windows se apaga: lo que pase con estas órdenes ya no cuenta
+                bool first = done.Count == 0;
+                foreach (var r in res.Values)
+                    if (r.Ok) { done.Add(r.Address); pending.Remove(r.Address); }
+                // En cuanto se enciende la primera (no al final: la web puede apagarlas mientras se insiste con otra)
+                if (first && done.Count > 0) NoteLightsOn();
+                // Cortado porque Windows empezó a cerrar la sesión: no cuenta como intento (arriba se espera)
+                if (pending.Count > 0 && ShuttingDown()) { tries--; continue; }
+                if (tries == 1 || pending.Count == 0) Log.Results(what + " (intento " + tries + ")", res);
+                if (pending.Count == 0) continue; // por si entretanto apareció otra tira; si no, termina arriba
+                for (int i = 0; i < 50 && !_ending && !ShuttingDown() && !PowerOnAsked; i++) Thread.Sleep(100);
+            }
+            if (pending.Count > 0 && !_ending)
+                Log.Write("No se pudo encender " + Log.List(pending) + " en " + (StartWindowMs / 1000) +
+                          " s. ¿Está enchufada, o conectada al móvil?");
         }
 
         /// <summary>
@@ -792,8 +832,10 @@ namespace LotusLED.Shutdown
                             // reenvío tiene una pasada aunque quede poco (SetAll da al menos 1,5 s).
                             lock (round)
                             {
-                                if (pending.Count == 0 || round.Cancelled ||
-                                    (!resendNow && Interlocked.Read(ref round.Deadline) - round.Clock.ElapsedMilliseconds < 2000))
+                                long leftNow = Interlocked.Read(ref round.Deadline) - round.Clock.ElapsedMilliseconds;
+                                // Aún sin el turno y con tiempo (puede haber crecido mientras se esperaba): se sigue esperando
+                                bool gateWait = !gate && !resent && leftNow > 2100;
+                                if ((pending.Count == 0 && !gateWait) || round.Cancelled || (!resendNow && leftNow < 2000))
                                 {
                                     // Sin el turno, una orden de encender pudo llegar después: no se da por apagada
                                     if (!gate)
@@ -805,14 +847,14 @@ namespace LotusLED.Shutdown
                                 }
                             }
                         }
-                        _exitCode = Lights.CountOk(res) == res.Count ? 0 : 3;
+                        if (!round.Superseded) _exitCode = Lights.CountOk(res) == res.Count ? 0 : 3;
                     }
                     finally { if (gate) Monitor.Exit(Lights.Gate); }
                     // Después de soltar el turno: si la tarea vuelve a intentarlo, que no espere al disco
                     Log.Results(round.Superseded ? "Apagar (primer intento)" :
                                 round.Cancelled ? "Apagar (cortado: el apagado no siguió)" : "Apagar", res);
                 }
-                catch (Exception ex) { _exitCode = 1; Log.Write("Error al apagar: " + ex.Message); }
+                catch (Exception ex) { if (!round.Superseded) _exitCode = 1; Log.Write("Error al apagar: " + ex.Message); }
                 finally
                 {
                     try { round.Done.Set(); } catch { }
@@ -943,6 +985,9 @@ namespace LotusLED.Shutdown
                 if (round != null)
                 {
                     round.Done.WaitOne((int)Math.Max(3000, Interlocked.Read(ref round.Deadline) + 3000 - round.Clock.ElapsedMilliseconds));
+                    // La tarea leyó las opciones al empezar (no las vigila): se vuelven a leer, por si entretanto se
+                    // apagaron las luces desde la ventana (LightsOn=False)
+                    if (mode == GuardMode.OffNow) { try { _cfg = Config.Load(_macs, _cfg); } catch { } }
                     var cfg = _cfg;
                     // La tarea tiene que acabar antes de su límite de 4 min (si no, Windows la corta a medias)
                     int onBudget = mode == GuardMode.OffNow
@@ -985,7 +1030,10 @@ namespace LotusLED.Shutdown
                     }
                 }
                 // No había ayudante: que se quede uno vigilando para el próximo apagado, y esta tarea se va. Salvo que
-                // entretanto haya empezado otro apagado: entonces esta tarea vuelve a apagar y Windows la cierra.
+                // entretanto haya empezado otro apagado: mientras Windows cierra la sesión se espera (nos llegará la
+                // pregunta y esta tarea volverá a apagar; si se cancela antes, sigue). El límite de 4 min la cortaría.
+                if (mode == GuardMode.OffNow)
+                    while (ShuttingDown() && !_ending && gen == Thread.VolatileRead(ref _resumeGen)) Thread.Sleep(500);
                 if (mode == GuardMode.OffNow && !_ending && gen == Thread.VolatileRead(ref _resumeGen))
                 {
                     StartResidentHelper(helperOn);
@@ -1034,7 +1082,8 @@ namespace LotusLED.Shutdown
                     for (int i = 0; i < 200; i++)
                     {
                         EventWaitHandle e;
-                        if (EventWaitHandle.TryOpenExisting(Helper.RestoreEventNameForGuard, out e)) { sent = SetAndClose(e); break; }
+                        try { if (EventWaitHandle.TryOpenExisting(Helper.RestoreEventNameForGuard, out e)) { sent = SetAndClose(e); break; } }
+                        catch (UnauthorizedAccessException) { break; }
                         Thread.Sleep(100);
                     }
                     Log.Write(sent ? "Tarea de respaldo: le pido que vuelva a encender las luces."
@@ -1062,10 +1111,14 @@ namespace LotusLED.Shutdown
 
         static bool MutexExists()
         {
-            Mutex m;
-            if (!Mutex.TryOpenExisting(Helper.MutexNameForGuard, out m)) return false;
-            m.Dispose();
-            return true;
+            try
+            {
+                Mutex m;
+                if (!Mutex.TryOpenExisting(Helper.MutexNameForGuard, out m)) return false;
+                m.Dispose();
+                return true;
+            }
+            catch (UnauthorizedAccessException) { return true; } // existe, de un ayudante abierto como administrador
         }
 
         /// <summary>
@@ -1279,9 +1332,9 @@ namespace LotusLED.Shutdown
             if (ShuttingDown())
             {
                 // Windows sigue cerrando la sesión (otro programa le hace esperar): nos llegará la pregunta, y con ella
-                // el reintento si el apagado no llegó a todas. Se mira cada 10 s hasta poco antes del límite de 4 min.
-                // Cerca del límite ya no da tiempo a volver a encender: se va, salvo que Windows ya haya preguntado o esté
-                // apagando las luces (entonces sigue hasta el final, o hasta que el límite la corte).
+                // el reintento si el apagado no llegó a todas. Se mira cada 10 s. No se va: si el límite de 4 min la
+                // corta, queda igual que si se fuera; y si el apagado se cancela antes, vuelve a encender (o se lo deja
+                // al ayudante).
                 var r = _round;
                 if (r != null && !_ending && !r.Cancelled && Native.Wait(r.Done, 0) && !AllOk(r))
                 {
@@ -1292,9 +1345,19 @@ namespace LotusLED.Shutdown
                     StartOff(hwnd, "Windows sigue cerrando la sesión: vuelvo a intentar apagar", true);
                     r = _round;
                 }
-                bool busy = _ending || (r != null && (!Native.Wait(r.Done, 0) || (!r.Cancelled && !AllOk(r))));
-                if (busy || _age.ElapsedMilliseconds + TaskRecheckMs < TaskLimitMs - TaskMarginMs) ScheduleTaskCheck(hwnd, gen, TaskRecheckMs);
-                else Quit();
+                // Cerca del límite (el Programador de tareas la cortará) se deja ya un ayudante con el aviso de volver a
+                // encender: espera mientras Windows cierra la sesión, enciende si este apagado se cancela (y LightsOn) y,
+                // si le llega la pregunta, apaga él
+                if (!_handedOff && _age.ElapsedMilliseconds + TaskRecheckMs >= TaskLimitMs - TaskMarginMs)
+                {
+                    _handedOff = true;
+                    StartThread(() =>
+                    {
+                        Log.Write("Tarea de respaldo: Windows sigue cerrando la sesión y llega mi límite de 4 min; dejo el ayudante.");
+                        StartResidentHelper(true);
+                    });
+                }
+                ScheduleTaskCheck(hwnd, gen, TaskRecheckMs);
                 return;
             }
             Resume(hwnd, "Tarea de respaldo: Windows no llegó a apagarse (se canceló o es un apagado con espera).");
