@@ -135,8 +135,9 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   o se lo deja al ayudante; y poco antes del límite (a los ~200 s, `HandOff`, una vez, con su propio reloj: no
   depende de la vigilancia) deja ya un ayudante con el aviso Restaura, que espera mientras Windows cierra la sesión,
   enciende si se cancela y apaga si le llega la pregunta. También si está esperando tras volver a la normalidad (otro
-  apagado, sin pregunta). Si ya se lo pidió, al cancelarse la tarea no enciende (lo hace el ayudante) ni se lo pide
-  otra vez; si después empieza otro apagado y la tarea vuelve a apagar, eso ya no vale (vuelve a encender ella). Si la
+  apagado, sin pregunta). Si ya se lo pidió, al cancelarse la tarea no enciende ella (encenderían los dos a la vez): se
+  lo pide otra vez al ayudante cuando su apagado ya acabó (un reintento de apagar suyo pudo llegar después de que
+  el ayudante encendiera). Si la
   pregunta llega tras volver a la normalidad, la vigilancia vuelve a empezar. Luego se queda: a los 75 s, si Windows no se está
   apagando (SM_SHUTTINGDOWN; si sí, vuelve a mirar cada 10 s hasta 30 s antes del límite y se va), si llega
   WM_ENDSESSION(FALSE), o si sigue viva 30 s después de WM_ENDSESSION(TRUE) (también en un segundo apagado; cada

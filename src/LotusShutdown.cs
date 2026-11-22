@@ -240,7 +240,7 @@ namespace LotusLED.Shutdown
         static int _resumeGen;                  // tarea de respaldo: qué vuelta a la normalidad vale para irse
         static int _handedOff;                  // tarea de respaldo: ya dejó un ayudante antes de su límite de 4 min (1)
         static readonly ManualResetEvent _handOffDone = new ManualResetEvent(false);
-        static volatile bool _handOffSent;      // ... y le pidió que vuelva a encender
+        static volatile bool _handOffSent;      // ... y pudo pedirle que vuelva a encender (desde ahí enciende él)
         static readonly Stopwatch _age = Stopwatch.StartNew();  // desde que arrancó el proceso (la tarea tiene 4 min)
         static EventWaitHandle _prepareEvent;   // la tarea de respaldo avisa de que se pidió apagar (ir conectando)
         static volatile bool _prepareBySystem;  // el aviso para ir conectando es porque Windows empezó a cerrar la sesión
@@ -802,8 +802,6 @@ namespace LotusLED.Shutdown
                 // Tras volver a la normalidad su vigilancia se había parado: vuelve (WM_ENDSESSION la reprograma)
                 if (_taskResumed) ScheduleTaskCheck(hwnd, ++_taskCheckGen, TaskRecheckMs);
                 _taskResumed = false;
-                // Lo que se le pidió al ayudante al dejarlo (HandOff) era por el apagado anterior: este vuelve a apagar
-                _handOffSent = false;
                 StartOff(hwnd, what);
             }
             else
@@ -1100,17 +1098,21 @@ namespace LotusLED.Shutdown
                     int onBudget = mode == GuardMode.OffNow
                         ? (int)Math.Min(PowerOnTryMs, TaskLimitMs - TaskMarginMs - _age.ElapsedMilliseconds)
                         : PowerOnTryMs;
-                    // Tarea: si ya dejó el ayudante cerca de su límite (HandOff) y le pidió que vuelva a encender, lo
-                    // hace él (si no, encenderían los dos a la vez)
+                    // Tarea: si ya dejó el ayudante cerca de su límite (HandOff), las enciende él (si no, encenderían los
+                    // dos a la vez). Se le pide otra vez ahora, con este apagado ya acabado: un reintento de apagar de la
+                    // tarea pudo llegar después de que él encendiera.
                     bool handedOff = false;
                     if (mode == GuardMode.OffNow && Thread.VolatileRead(ref _handedOff) != 0)
                     {
                         _handOffDone.WaitOne(30000);
                         handedOff = _handOffSent;
                     }
+                    bool wantOn = cfg != null && cfg.LightsOn && !_ending && round.Addrs.Count > 0;
                     if (handedOff)
-                        Log.Write("Tarea de respaldo: ya le pedí al ayudante que vuelva a encender; lo hace él.");
-                    else if (cfg != null && cfg.LightsOn && !_ending && round.Addrs.Count > 0)
+                    {
+                        if (wantOn) helperOn = true;
+                    }
+                    else if (wantOn)
                     {
                         // Tarea: si Windows vuelve a estar cerrando la sesión (otro apagado), no se enciende (nos llegará
                         // la pregunta). Unos segundos de margen, por si aún no ha bajado el aviso del que se canceló.
@@ -1154,9 +1156,7 @@ namespace LotusLED.Shutdown
                     while (ShuttingDown() && !_ending && gen == Thread.VolatileRead(ref _resumeGen)) Thread.Sleep(500);
                 if (mode == GuardMode.OffNow && !_ending && gen == Thread.VolatileRead(ref _resumeGen))
                 {
-                    // Si ya lo dejó HandOff con el aviso de volver a encender, no se le pide otra vez
-                    bool asked = Thread.VolatileRead(ref _handedOff) != 0 && _handOffDone.WaitOne(30000) && _handOffSent;
-                    StartResidentHelper(helperOn && !asked);
+                    StartResidentHelper(helperOn);
                     // Se va desde el hilo de la ventana, mirando otra vez: si mientras tanto Windows volvió a preguntar,
                     // esta tarea se queda apagando
                     Native.PostMessage(hwnd, WM_APP_TASKDONE, (IntPtr)gen, IntPtr.Zero);
