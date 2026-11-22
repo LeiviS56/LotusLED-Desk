@@ -29,19 +29,22 @@ function Test-Autostart {
     return ((Test-Path $startupLnk) -or (Test-Path $oldStartupLnk))
 }
 
-# El ayudante tiene que ser la versión 1.1 o más: la 1.0 tomaba cualquier argumento por una MAC y apagaba las luces
+# El ayudante tiene que ser la versión 1.1.1 o más: la 1.0 tomaba cualquier argumento por una MAC y apagaba las
+# luces, y la 1.1.0 no atendía el aviso para encender de un segundo "-watch -on"
 function Test-HelperOk {
     if (-not (Test-Path $helperExe)) { return $false }
     try {
         $v = [Version](Get-Item $helperExe).VersionInfo.FileVersion
-        return ($v -ge [Version]'1.1.0.0')
+        return ($v -ge [Version]'1.1.1.0')
     } catch { return $false }
 }
 
-function Test-HelperRunning {
-    $m = $null
+# ¿Hay un ayudante en marcha que vaya a apagar alguna tira al apagar el PC? (lo tiene abierto solo si tiene MAC y
+# la opción activada; sin MAC, o con uno de antes de la 1.1.2, apaga la ventana web como siempre)
+function Test-HelperArmed {
+    $e = $null
     try {
-        if ([System.Threading.Mutex]::TryOpenExisting('Local\LotusLED_Ayudante_Luces', [ref]$m)) { $m.Dispose(); return $true }
+        if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\LotusLED_Ayudante_Apaga', [ref]$e)) { $e.Dispose(); return $true }
     } catch {}
     return $false
 }
@@ -51,7 +54,8 @@ function Set-Autostart([bool]$enable) {
     if (Test-Path $oldStartupLnk) { Remove-Item -Force $oldStartupLnk -ErrorAction SilentlyContinue }
     if (-not $enable) {
         if (Test-Path $startupLnk) { Remove-Item -Force $startupLnk -ErrorAction SilentlyContinue }
-        return $true
+        # Si Windows no dejó borrarlo, sigue activado: que la web no diga lo contrario
+        return (-not (Test-Path $startupLnk))
     }
     if (-not (Test-HelperOk)) {
         if (Test-Path $startupLnk) { Remove-Item -Force $startupLnk -ErrorAction SilentlyContinue }
@@ -90,24 +94,21 @@ function Start-Helper([switch]$PowerOn) {
     } catch { return $false }
 }
 
-# Opciones que lee el ayudante (encender al iniciar, apagar al apagar y si las luces estaban encendidas)
-$script:autoCfgText = ''
-$script:cfgLightsOn = $true
-try {
-    if (Test-Path $autoCfg) {
-        $script:autoCfgText = [IO.File]::ReadAllText($autoCfg)
-        if ($script:autoCfgText -match '(?m)^LightsOn=False') { $script:cfgLightsOn = $false }
-    }
-} catch {}
+# Opciones que lee el ayudante (encender al iniciar, apagar al apagar y si las luces estaban encendidas).
+# El ayudante también escribe aquí (LightsOn=True cuando las enciende al iniciar Windows), así que siempre se
+# compara con lo que hay en el archivo, no con lo último que escribimos nosotros.
+function Read-AutoCfg {
+    try { if (Test-Path $autoCfg) { return [IO.File]::ReadAllText($autoCfg) } } catch {}
+    return ''
+}
 
 function Save-AutoCfg([bool]$powerOnStart, [bool]$powerOffShutdown, [bool]$lightsOn) {
     $text = "# LotusLED Desk: lo escribe la interfaz y lo lee LotusShutdown.exe (el ayudante sin ventana)`r`n" +
             "PowerOnStart=$powerOnStart`r`nPowerOffShutdown=$powerOffShutdown`r`nLightsOn=$lightsOn`r`n"
-    if ($text -eq $script:autoCfgText) { return }
+    if ($text -eq (Read-AutoCfg)) { return }
     try {
         New-Item -ItemType Directory -Force -Path (Split-Path $autoCfg) | Out-Null
         [IO.File]::WriteAllText($autoCfg, $text)
-        $script:autoCfgText = $text
     } catch {}
 }
 
@@ -197,12 +198,12 @@ $script:lastDeviceState = @{
 # Antes se esperaba aquí a /api/shutdown-ack, pero este hilo es el único que atiende peticiones, así que la
 # confirmación no podía llegar y el aviso a la ventana salía tarde. Ahora se contesta al momento la petición
 # /api/poll que la ventana tiene abierta y se atienden aquí mismo las que lleguen hasta que confirma (máx. 2 s).
-# Con el ayudante (LotusShutdown.exe) en marcha no se hace nada: él apaga la tira el último, cuando el navegador ya
-# se cerró, y solo si nadie canceló el apagado. Apagarla desde aquí la dejaría apagada aunque luego se cancelara.
-# Esto queda solo para cuando no hay ayudante.
+# Con el ayudante (LotusShutdown.exe) en marcha y con tiras que apagar no se hace nada: él apaga la tira el último,
+# cuando el navegador ya se cerró, y solo si nadie canceló el apagado. Apagarla desde aquí la dejaría apagada aunque
+# luego se cancelara. Esto queda para cuando no hay ayudante, o no sabe qué tira es (sin MAC en device.cfg).
 $onSessionEnding = {
     param($sender, $e)
-    if (Test-HelperRunning) { return }
+    if (Test-HelperArmed) { return }
     $script:isShuttingDown = $true
     $script:shutdownAck = $false
     $script:shutdownWatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -367,7 +368,14 @@ function Handle-Api($ctx, $path) {
                     Send-Json $res $ev
                     return
                 }
-                if ($script:acceptTask -and $script:acceptTask.IsCompleted) { break }
+                # Llegó otra petición: se corta la espera, salvo que sea otro /api/poll (dos ventanas abiertas
+                # se lo irían pasando sin parar); ese espera su turno, como antes
+                $t = $script:acceptTask
+                if ($t -and $t.IsCompleted) {
+                    $isPoll = $false
+                    try { $isPoll = ($t.Status -eq 'RanToCompletion' -and $t.Result.Request.Url.AbsolutePath -eq '/api/poll') } catch {}
+                    if (-not $isPoll) { break }
+                }
                 Start-Sleep -Milliseconds 80
             }
             if ([object]::ReferenceEquals($script:pollRes, $res)) {
@@ -397,11 +405,12 @@ function Handle-Api($ctx, $path) {
                 if ($null -ne $data.keepInBackground) {
                     $script:keepInBackground = [bool]$data.keepInBackground
                 }
-                # Para el ayudante sin ventana (LotusShutdown.exe)
-                if ($data.connected) { $script:cfgLightsOn = [bool]$data.power }
+                # Para el ayudante sin ventana (LotusShutdown.exe). Sin tira conectada, la web no sabe cómo están
+                # las luces: se deja lo que haya (puede haberlo escrito el ayudante al encenderlas)
+                $lightsOn = if ($data.connected) { [bool]$data.power } else { (Read-AutoCfg) -notmatch '(?m)^LightsOn=False' }
                 $pos = if ($null -ne $data.powerOnStart) { [bool]$data.powerOnStart } else { $true }
                 $pof = if ($null -ne $data.powerOffShutdown) { [bool]$data.powerOffShutdown } else { $true }
-                Save-AutoCfg $pos $pof $script:cfgLightsOn
+                Save-AutoCfg $pos $pof $lightsOn
                 if ($notifyIcon) {
                     $estado = if ($data.power) { 'Encendido' } else { 'Apagado' }
                     $tip = if ($data.connected) {

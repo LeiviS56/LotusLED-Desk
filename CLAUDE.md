@@ -65,16 +65,26 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   que se guarda una copia en %LOCALAPPDATA%\LotusLED\ultimas-tiras.cfg que solo se usa si no se puede leer.
 - Encender nunca llega después de apagar: el aviso de Windows activa `Lights.Abort` (corta al momento las esperas
   de las órdenes de encender) y el apagado se queda `Lights.Gate` hasta el final.
-- WM_ENDSESSION(FALSE), o seguir vivo 30 s después de WM_ENDSESSION(TRUE), es que el apagado no siguió: vuelve a
-  encender si LightsOn (la web lo actualiza en cada encendido/apagado). En la práctica casi nunca pasa.
-- Con `-on`, al arrancar enciende las tiras (insiste hasta 3 min, la tira puede tardar en arrancar). Si ya hay un
-  ayudante en marcha, el nuevo con `-on` se lo pide con el evento `Local\LotusLED_Ayudante_Encender` y termina.
-- `RegisterApplicationRestart("-watch")`: si Restart Manager (un instalador) lo cierra, Windows lo vuelve a abrir.
+- WM_ENDSESSION(FALSE), o seguir vivo 30 s después de WM_ENDSESSION(TRUE) (o 37 s después de la pregunta sin
+  WM_ENDSESSION), es que el apagado no siguió: corta el apagado si aún iba y vuelve a encender todas las tiras que
+  mandó apagar si LightsOn. Cada apagado lleva un número y esos avisos solo valen para el suyo; si Windows vuelve a
+  preguntar antes, empieza un apagado nuevo. LightsOn lo actualizan la web (en cada encendido/apagado) y el ayudante
+  (al encender al iniciar sesión). En la práctica casi nunca pasa.
+- Con `-on`, al arrancar enciende las tiras (insiste hasta 3 min, la tira puede tardar en arrancar; en cada intento
+  mira las tiras de ese momento). Si ya hay un ayudante en marcha, el nuevo con `-on` se lo pide con el evento
+  `Local\LotusLED_Ayudante_Encender` y termina.
+- Sin `RegisterApplicationRestart`: con él, al reiniciar con "reiniciar aplicaciones" Windows manda
+  ENDSESSION_CLOSEAPP y el ayudante creería que es un instalador. CLOSEAPP solo se toma por un instalador si
+  `GetSystemMetrics(SM_SHUTTINGDOWN)` es 0; entonces se cierra y vigila la tarea de respaldo.
 - `-task` (tarea de respaldo, evento 1074): si no hay ayudante, hace lo mismo que él (ventana oculta, nivel 0x100,
-  motivo) y termina al acabar. Antes la tarea moría a medias (0xC000013A el 1-nov) o ni arrancaba (15 y 21-nov).
+  motivo) y termina al acabar. No se queda el mutex del ayudante. Como empieza antes, puede insistir hasta 15 s
+  (pero en WM_ENDSESSION retiene como el ayudante). Antes la tarea moría a medias (0xC000013A el 1-nov) o ni
+  arrancaba (15 y 21-nov).
 - Escritura: la primera puede esperar a que Windows conecte (lo guardado con Cached no conecta), así que tiene casi
   todo el tiempo. Sin respuesta (FFF3 de la ELK-BLEDDM): dos tramas y una lectura sin caché de FFF3; si la lectura
-  no vuelve o da Unreachable, se reintenta. Si un intento falla, el siguiente busca sin caché. OpenAsync
+  no vuelve o da Unreachable, se reintenta (AccessDenied lo dice Windows sin preguntar a la tira: se trata como si no
+  se pudiera leer). Antes de cada trama de encender se mira Abort. Si la característica admite las dos escrituras, la
+  de con respuesta tiene 2/3 del tiempo. Si un intento falla, el siguiente busca sin caché. OpenAsync
   (SharedReadAndWrite) se pide antes de GetCharacteristicsAsync, como Chrome. Las MELK reciben su saludo antes.
 - Sin emparejar, `FromBluetoothAddressAsync` da null si Windows no ha visto la tira hace poco (tras reiniciar):
   se escucha su anuncio unos segundos y se reintenta ("hubo que buscarla" en el registro). Con la tira ausente,
@@ -84,16 +94,18 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   escribe `LotusLED.ps1` con lo que manda la web (/api/state) y también `AppSettings.Save` del exe nativo.
 - Registro: %LOCALAPPDATA%\LotusLED\LotusShutdown.log (cada arranque, encendido y apagado, con tiempos).
 - Qué tiras: argumentos + `device.cfg` (junto al exe o en %LOCALAPPDATA%\LotusLED). settings.cfg (LastAddress) solo
-  si no hay device.cfg, porque puede ser la tira del vecino. `Instalar` busca tiras (`-find`) si no hay device.cfg.
+  si no hay ningún device.cfg, porque puede ser la tira del vecino; un device.cfg sin MAC ("0 = ninguna" en
+  Instalar) es ninguna. `Instalar` busca tiras (`-find`) si no hay MAC en device.cfg.
 - Windows comparte la conexión BLE entre programas: el ayudante puede escribir aunque la web tenga la tira conectada.
   No guardar conexiones abiertas entre apagados (la tira dejaría de anunciarse).
 - `LotusLED.ps1`: con el ayudante en marcha, su aviso SessionEnding no hace nada (apagar desde la web dejaría la tira
   apagada aunque luego se cancelara el apagado). Nunca abre la ventana al iniciar Windows: sin ayudante válido, el
   inicio automático no se activa. La espera larga de /api/poll se corta si llega otra petición.
-- Versión: `LotusLED.ps1` e `Instalar.ps1` exigen LotusShutdown.exe 1.1 o más (la 1.0 tomaba cualquier argumento por
-  una MAC y apagaba las luces). Si no compila, `Instalar` no instala nada.
-- `build.ps1` cierra el ayudante de esta carpeta antes de compilar (si no, el .exe está bloqueado) y lo vuelve a
-  abrir. Usa /codepage:65001 porque MainForm.cs, BleManager.cs y Program.cs no llevan BOM y tienen acentos.
+- Versión: `LotusLED.ps1` e `Instalar.ps1` exigen LotusShutdown.exe 1.1.1 o más (la 1.0 tomaba cualquier argumento
+  por una MAC y apagaba las luces; la 1.1.0 no atendía el aviso para encender). La actual es la 1.1.2. Si no
+  compila, `Instalar` no instala nada.
+- `build.ps1` cierra solo el ayudante de esta carpeta (misma ruta del .exe) antes de compilar (si no, el .exe está
+  bloqueado) y lo vuelve a abrir. Usa /codepage:65001 porque MainForm.cs, BleManager.cs y Program.cs no llevan BOM y tienen acentos.
 - Instalado en el PC del usuario el 22-nov (rama local suya con el rediseño estilo Apple, sin subir): la prueba
   `-probe` llegó a la tira en 4,4 s.
 

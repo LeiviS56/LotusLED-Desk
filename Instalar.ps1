@@ -29,13 +29,13 @@ function New-Shortcut($path, $target, [string]$arguments, [string]$desc, [int]$s
 
 Write-Output "Instalando LotusLED Desk desde: $dir`n"
 
-# El ayudante tiene que ser la versión 1.1 o más: la 1.0 tomaba cualquier argumento por una MAC y apagaba las
-# luces, así que con ella en Inicio las luces se apagarían al iniciar Windows.
+# El ayudante tiene que ser la versión 1.1.1 o más: la 1.0 tomaba cualquier argumento por una MAC y apagaba las
+# luces (con ella en Inicio se apagarían al iniciar Windows), y la 1.1.0 no atendía el aviso para encender.
 function Test-HelperOk {
     if (-not (Test-Path $helper)) { return $false }
     try {
         $v = [Version](Get-Item $helper).VersionInfo.FileVersion
-        return ($v -ge [Version]'1.1.0.0')
+        return ($v -ge [Version]'1.1.1.0')
     } catch { return $false }
 }
 
@@ -109,12 +109,18 @@ if (@(Get-KnownMacs).Count -eq 0) {
             $k = 0
             if ([int]::TryParse($n.Trim(), [ref]$k) -and $k -ge 1 -and $k -le $list.Count) { $chosen += $list[$k - 1] }
         }
+        $lines = @('# MAC de tus tiras LED (una por línea). Las usa LotusShutdown.exe para encenderlas y apagarlas.',
+                   '# Este archivo es personal y NO se sube a GitHub (está en .gitignore).')
         if ($chosen.Count -gt 0) {
-            $lines = @('# MAC de tus tiras LED (una por línea). Las usa LotusShutdown.exe para encenderlas y apagarlas.',
-                       '# Este archivo es personal y NO se sube a GitHub (está en .gitignore).')
             foreach ($c in $chosen) { $p = $c.Split('|'); $lines += "# $($p[1])"; $lines += $p[0] }
             Set-Content -Path $deviceCfg -Value $lines -Encoding UTF8
             Write-Output "  Guardado en device.cfg."
+        } elseif ($ans.Trim() -eq '0') {
+            # Elegiste ninguna: device.cfg sin MAC, para que el ayudante no use la última tira de LotusLED.exe
+            # (settings.cfg), que puede ser la de un vecino
+            $lines += '# Elegiste "ninguna" al instalar: el ayudante no enciende ni apaga ninguna tira.'
+            Set-Content -Path $deviceCfg -Value $lines -Encoding UTF8
+            Write-Output "  Ninguna: las luces no se encenderán ni apagarán solas hasta que pongas una MAC en device.cfg."
         }
     }
     Write-Output ""
@@ -151,11 +157,17 @@ try {
 
 # 6. Arrancar el ayudante ya (cerrando uno anterior, por si era de otra versión o de otra carpeta).
 #    Sin -on: instalar no cambia las luces; se encenderán solas la próxima vez que inicies Windows.
+$unknown = 0
 Get-Process -Name 'LotusShutdown' -ErrorAction SilentlyContinue | Where-Object {
-    # Uno que esté buscando tiras o comprobándolas (-find, -probe) se deja terminar
+    # Uno que esté buscando tiras o comprobándolas (-find, -probe) se deja terminar, y uno del que no se pueda
+    # leer qué hace (de otro usuario o como administrador) también
     $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction SilentlyContinue).CommandLine
-    -not $cmd -or $cmd -match '-watch|-task'
+    if (-not $cmd) { $script:unknown++ }
+    $cmd -and $cmd -match '-watch|-task'
 } | Stop-Process -Force -ErrorAction SilentlyContinue
+if ($unknown -gt 0) {
+    Write-Output "  (Hay $unknown LotusShutdown.exe que no se pudo identificar; si las luces no van bien, reinicia el PC.)"
+}
 Start-Sleep -Milliseconds 500
 Start-Process -FilePath $helper -ArgumentList '-watch' -WorkingDirectory $dir | Out-Null
 

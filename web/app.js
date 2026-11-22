@@ -173,24 +173,36 @@
   led.addEventListener('log', (e) => addLog(e.detail));
 
   let reportTimer;
+  let reportPending = false;
+  function sendBackendState(keepalive) {
+    reportPending = false;
+    fetch('/api/state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // keepalive: que llegue aunque se esté cerrando la ventana
+      keepalive,
+      body: JSON.stringify({
+        connected: led.connected,
+        power: state.power,
+        name: led.info?.name || '',
+        keepInBackground: state.keepInBackground,
+        // Los lee el ayudante sin ventana (LotusShutdown.exe) para encender al iniciar y apagar al apagar
+        powerOnStart: state.powerOnStart,
+        powerOffShutdown: state.powerOffShutdown,
+      }),
+    }).catch(() => {});
+  }
   function reportBackendState() {
     clearTimeout(reportTimer);
-    reportTimer = setTimeout(() => {
-      fetch('/api/state', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          connected: led.connected,
-          power: state.power,
-          name: led.info?.name || '',
-          keepInBackground: state.keepInBackground,
-          // Los lee el ayudante sin ventana (LotusShutdown.exe) para encender al iniciar y apagar al apagar
-          powerOnStart: state.powerOnStart,
-          powerOffShutdown: state.powerOffShutdown,
-        }),
-      }).catch(() => {});
-    }, 250);
+    reportPending = true;
+    reportTimer = setTimeout(() => sendBackendState(false), 250);
   }
+  // Si se cierra la ventana justo después de apagar o cambiar una opción, que el ayudante se entere igualmente
+  window.addEventListener('pagehide', () => {
+    if (!reportPending) return;
+    clearTimeout(reportTimer);
+    sendBackendState(true);
+  });
 
   function pushStateToDevice() {
     led.power(state.power);

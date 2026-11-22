@@ -42,7 +42,10 @@ $helper = Join-Path $here 'LotusShutdown.exe'
 $wasRunning = @(Get-Process -Name 'LotusShutdown' -ErrorAction SilentlyContinue | Where-Object {
     $p = $null
     try { $p = $_.Path } catch {}
-    -not $p -or $p -eq $helper
+    if (-not $p) {
+        try { $p = (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction Stop).ExecutablePath } catch {}
+    }
+    $p -and $p -eq $helper
 })
 if ($wasRunning.Count -gt 0) {
     $wasRunning | Stop-Process -Force -ErrorAction SilentlyContinue
