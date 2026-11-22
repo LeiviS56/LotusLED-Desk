@@ -91,6 +91,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 | `LotusShutdown.exe -watch -on` | Lo que se arranca con Windows: enciende las tiras y se queda vigilando el apagado |
 | `LotusShutdown.exe` | Apaga las tiras ahora |
 | `LotusShutdown.exe -on` | Las enciende ahora |
+| `LotusShutdown.exe -probe` | Comprueba que llega a las tiras sin cambiar las luces (el resultado va al registro) |
 
 Lo que hace queda apuntado en `%LOCALAPPDATA%\LotusLED\LotusShutdown.log`: ahí se ve si la orden llegó
 al apagar y cuánto tardó.

@@ -135,10 +135,11 @@ try {
     Write-Output "  (No se pudo crear la tarea de respaldo: $($_.Exception.Message))"
 }
 
-# 6. Arrancar el ayudante ya (cerrando uno anterior, por si era de otra versión o de otra carpeta)
+# 6. Arrancar el ayudante ya (cerrando uno anterior, por si era de otra versión o de otra carpeta).
+#    Sin -on: instalar no cambia las luces; se encenderán solas la próxima vez que inicies Windows.
 Get-Process -Name 'LotusShutdown' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
-Start-Process -FilePath $helper -ArgumentList '-watch -on' -WorkingDirectory $dir | Out-Null
+Start-Process -FilePath $helper -ArgumentList '-watch' -WorkingDirectory $dir | Out-Null
 
 Write-Output "`nInstalación completada."
 Write-Output "Las luces se encenderán solas al iniciar Windows (sin abrir nada) y se apagarán al apagar el PC."

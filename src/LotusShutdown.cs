@@ -24,6 +24,8 @@ using Windows.Storage.Streams;
 //   LotusShutdown.exe -task        Lo usa la tarea programada de respaldo: no hace nada si el ayudante ya vigila.
 //   LotusShutdown.exe -find <archivo> [segundos]
 //                                  Busca tiras cercanas y guarda una por línea "MAC|nombre|señal" (lo usa Instalar).
+//   LotusShutdown.exe -probe       Comprueba que llega a las tiras (conecta y busca dónde escribir) sin cambiar
+//                                  las luces, y lo apunta en el registro.
 //
 // Qué tiras: las MAC que se pasen como argumento y las de device.cfg (junto al .exe o en %LOCALAPPDATA%\LotusLED);
 // solo si no hay ninguna, la última que usó LotusLED.exe (settings.cfg).
@@ -46,7 +48,7 @@ namespace LotusLED.Shutdown
         [STAThread]
         static int Main(string[] args)
         {
-            bool watch = false, on = false, task = false;
+            bool watch = false, on = false, task = false, probe = false;
             string findFile = null;
             int findSeconds = 8;
             var macs = new List<string>();
@@ -58,6 +60,7 @@ namespace LotusLED.Shutdown
                 else if (k == "on" || k == "encender") on = true;
                 else if (k == "off" || k == "apagar") on = false;
                 else if (k == "task" || k == "tarea") task = true;
+                else if (k == "probe" || k == "probar") probe = true;
                 else if (k == "find" || k == "buscar")
                 {
                     findFile = (i + 1 < args.Length) ? args[++i] : Path.Combine(Config.DataDir, "tiras-encontradas.txt");
@@ -70,6 +73,7 @@ namespace LotusLED.Shutdown
             try
             {
                 if (findFile != null) return Finder.Run(findFile, findSeconds);
+                if (probe) return Lights.Probe(Config.Addresses(macs));
                 if (watch) return Guard.Run(macs, on);
                 return RunOnce(macs, on, task);
             }
@@ -498,6 +502,48 @@ namespace LotusLED.Shutdown
                 if (ok) return;
                 Thread.Sleep((int)Math.Max(0, Math.Min(500, budgetMs - clock.ElapsedMilliseconds - 400)));
             }
+        }
+
+        /// <summary>Conecta con cada tira y busca dónde escribir, pero no manda nada: las luces no cambian.</summary>
+        public static int Probe(List<ulong> addrs)
+        {
+            if (addrs.Count == 0)
+            {
+                Log.Write("Prueba: no hay ninguna MAC en device.cfg.");
+                return 2;
+            }
+            int ok = 0;
+            foreach (var addr in addrs)
+            {
+                var clock = Stopwatch.StartNew();
+                string err = "";
+                StripLink link = null;
+                for (int attempt = 1; attempt <= 3 && link == null && clock.ElapsedMilliseconds < 15000; attempt++)
+                {
+                    link = Open(addr, clock, 20000, out err);
+                    if (link == null) Thread.Sleep(500);
+                }
+                if (link != null)
+                {
+                    ok++;
+                    var p = link.Char.CharacteristicProperties;
+                    Log.Write("Prueba " + link.Name + " " + Log.Short(addr) + ": se llega en " + clock.ElapsedMilliseconds +
+                        " ms (" + (link.Melk ? "MELK" : "ELK") + ", servicio " + Uuid16(link.Char.Service.Uuid) +
+                        ", característica " + Uuid16(link.Char.Uuid) +
+                        ((p & GattCharacteristicProperties.Write) != 0 ? ", escritura con respuesta" : ", escritura sin respuesta") +
+                        ((p & GattCharacteristicProperties.Read) != 0 ? ", se puede leer" : "") + ").");
+                    link.Dispose();
+                }
+                else Log.Write("Prueba " + Log.Short(addr) + ": no se llega (" + err + ").");
+            }
+            return ok == addrs.Count ? 0 : 3;
+        }
+
+        static string Uuid16(Guid uuid)
+        {
+            string u = uuid.ToString();
+            return u.EndsWith("-0000-1000-8000-00805f9b34fb", StringComparison.OrdinalIgnoreCase) && u.StartsWith("0000")
+                ? u.Substring(4, 4) : u;
         }
 
         /// <summary>Conecta con la tira y busca dónde escribir. Primero con lo que Windows ya tiene guardado (rápido).</summary>
