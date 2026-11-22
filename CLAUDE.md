@@ -99,8 +99,8 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
 - Encender nunca llega después de apagar: el aviso de Windows activa `Lights.Abort` (corta al momento las esperas
   de las órdenes de encender) y el apagado se queda `Lights.Gate` hasta el final (lo espera hasta 4 s; si no lo
   consiguió, en cuanto la orden de encender lo suelta vuelve a apagar, una vez y aunque quede poco tiempo, las que ya
-  había apagado; si el tiempo crece mientras lo espera, lo sigue esperando; si nunca lo consigue, no las da por
-  apagadas: "sin confirmar"). Lo suelta antes de apuntar el
+  había apagado; ya apagadas todas, lo espera hasta 0,5 s antes del final, aunque el tiempo crezca, y deja de
+  esperarlo si el apagado se cancela; si nunca lo consigue, no las da por apagadas: "sin confirmar"). Lo suelta antes de apuntar el
   resultado. Si el apagado no sigue, sus esperas se cortan (`OffRound.CancelEvent`), para que no apague segundos después. El apagado
   apunta en el registro desde otro hilo, para no esperar al disco antes de la primera orden.
 - ENDSESSION_CLOSEAPP con LOGOFF es un cierre de sesión, no un instalador.
@@ -132,8 +132,12 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   mutex). Mientras Windows sigue cerrando la sesión, si el apagado adelantado no llegó a todas, lo vuelve a intentar
   en cada vigilancia (cada 10 s). Mientras Windows cierra la sesión no se va nunca (antes se iba en mitad de un
   apagado que Windows había retrasado ~200 s): si el apagado se cancela antes del límite de 4 min, vuelve a encender
-  o se lo deja al ayudante; y poco antes del límite (a los ~205 s) deja ya un ayudante con el aviso Restaura, que
-  espera mientras Windows cierra la sesión, enciende si se cancela y apaga si le llega la pregunta. Luego se queda: a los 75 s, si Windows no se está
+  o se lo deja al ayudante; y poco antes del límite (a los ~200 s, `HandOff`, una vez) deja ya un ayudante con el
+  aviso Restaura, que espera mientras Windows cierra la sesión, enciende si se cancela y apaga si le llega la
+  pregunta. También si está esperando tras volver a la normalidad (otro apagado, sin pregunta). Si ya se lo pidió, al
+  cancelarse la tarea no enciende (lo hace el ayudante) ni se lo pide otra vez. Tras WM_ENDSESSION(TRUE) la
+  vigilancia siguiente llega como tarde a los ~200 s; si la pregunta llega tras volver a la normalidad, la vigilancia
+  vuelve a empezar. Luego se queda: a los 75 s, si Windows no se está
   apagando (SM_SHUTTINGDOWN; si sí, vuelve a mirar cada 10 s hasta 30 s antes del límite y se va), si llega
   WM_ENDSESSION(FALSE), o si sigue viva 30 s después de WM_ENDSESSION(TRUE) (también en un segundo apagado; cada
   vigilancia lleva un número y la de los 75 s deja de valer), el apagado se canceló o es con
@@ -172,7 +176,7 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   ayudante válido, el inicio automático no se activa. La espera larga de /api/poll se corta si llega otra petición
   (que no sea otro /api/poll).
 - Versión: `LotusLED.ps1` e `Instalar.ps1` exigen LotusShutdown.exe 1.1.1 o más (la 1.0 tomaba cualquier argumento
-  por una MAC y apagaba las luces; la 1.1.0 no atendía el aviso para encender). La actual es la 1.1.8. Si no
+  por una MAC y apagaba las luces; la 1.1.0 no atendía el aviso para encender). La actual es la 1.1.9. Si no
   compila, `Instalar` no instala nada.
 - El ayudante se abre siempre fuera del job de quien lo abre (`Start-HelperDetached` en build.ps1, Instalar.ps1 y
   LotusLED.ps1, y `StartResidentHelper` en la tarea). Primero lo crea el servicio WMI (`Win32_Process.Create`; medido
@@ -188,7 +192,8 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   otro; con `-on` se le manda el aviso de encender (también si el que queda es otro que se abrió a la vez). Al
   arrancar, el ayudante apunta en el registro si está en un job con más procesos o con KILL_ON_JOB_CLOSE
   (`JobWarning`; el job de un solo proceso no avisa; solo se mira el job más cercano). Si el mutex o los avisos son
-  de un ayudante abierto como administrador, abrirlos da acceso denegado: se toma como que existe (antes, excepción). `Instalar` llama a
+  de un ayudante abierto como administrador, abrirlos da acceso denegado: se toma como que existe (antes, excepción); también en `Test-HelperArmed`, y un `-watch` nuevo lo apunta y se cierra
+  (antes, "Error inesperado"). A ese ayudante no se le pueden mandar avisos (encender, Restaura, Prepara). `Instalar` llama a
   `build.ps1 -NoHelperRestart`; si no compila, `build.ps1` vuelve a abrir el de antes igualmente. Motivo: el 22-nov
   a las 05:05 el usuario apagó con el botón y el ayudante no dejó ni una línea; lo había abierto Instalar.ps1 desde
   Claude Code (Remote Control), así que estaba en el job de Claude y desapareció con Claude antes de que le llegara el
@@ -197,8 +202,10 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   de un apagado puede no recibir la pregunta y encendería detrás. Encender al iniciar (y volver a encender por el
   evento Restaura) se queda esperando, sin contar ese rato, y sigue si el apagado se cancela; solo lo termina la
   pregunta de Windows (`_ending`); un intento cortado así no cuenta. Las peticiones de encender se juntan
-  (`_askLogon`/`_askRestore`): una que llega mientras se atiende otra hace que la que está en marcha vuelva a empezar
-  con las dos y con todas las tiras (antes se perdía). La tarea tampoco vuelve a encender si Windows está cerrando la sesión otra vez
+  (`_askLogon`/`_askRestore`): la que está en marcha suma la que llega (en la 1.1.8 volvía a empezar solo con la
+  nueva: se perdía la otra). Con Restaura vuelve a encender todas (un apagado cancelado pudo apagarlas); otra de
+  iniciar sesión (el aviso que manda `Start-HelperDetached` con -on al ayudante que acaba de abrir) no repite las ya
+  encendidas. La tarea tampoco vuelve a encender si Windows está cerrando la sesión otra vez
   (espera 5 s por si aún no bajó el aviso del apagado cancelado): se lo deja al ayudante (Restaura) y se queda a
   esperar la pregunta: no deja el ayudante ni se va (`OnTaskDone`) mientras SM_SHUTTINGDOWN.
 - `build.ps1` cierra solo el ayudante de esta carpeta (misma ruta del .exe) antes de compilar (si no, el .exe está

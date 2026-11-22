@@ -44,8 +44,8 @@ using Windows.Storage.Streams;
 [assembly: AssemblyTitle("LotusLED Desk - luces")]
 [assembly: AssemblyDescription("Enciende las tiras LED al iniciar Windows y las apaga al apagar el PC")]
 [assembly: AssemblyProduct("LotusLED Desk")]
-[assembly: AssemblyVersion("1.1.8.0")]
-[assembly: AssemblyFileVersion("1.1.8.0")]
+[assembly: AssemblyVersion("1.1.9.0")]
+[assembly: AssemblyFileVersion("1.1.9.0")]
 
 namespace LotusLED.Shutdown
 {
@@ -197,6 +197,8 @@ namespace LotusLED.Shutdown
         // Límite de la tarea programada (Instalar.ps1: ExecutionTimeLimit de 4 min); volver a encender acaba antes
         const int TaskLimitMs = 240000;
         const int TaskMarginMs = 30000;    // volver a encender, dejar el ayudante (hasta 20 s) y salir
+        // Si Windows aún está cerrando la sesión, a partir de aquí (~200 s) se deja ya el ayudante (ver HandOff)
+        const int HandOffAtMs = TaskLimitMs - TaskMarginMs - TaskRecheckMs;
 
         public const int WM_APP_OFFDONE = 0x8001;
         public const int WM_APP_RESUMECHECK = 0x8002;
@@ -223,7 +225,9 @@ namespace LotusLED.Shutdown
         static bool _taskResumed;               // tarea de respaldo: el apagado no siguió y ya se volvió a encender
         static int _taskCheckGen;               // tarea de respaldo: qué vigilancia vale (los avisos de otra se ignoran)
         static int _resumeGen;                  // tarea de respaldo: qué vuelta a la normalidad vale para irse
-        static bool _handedOff;                 // tarea de respaldo: ya dejó un ayudante antes de su límite de 4 min
+        static int _handedOff;                  // tarea de respaldo: ya dejó un ayudante antes de su límite de 4 min (1)
+        static readonly ManualResetEvent _handOffDone = new ManualResetEvent(false);
+        static volatile bool _handOffSent;      // ... y le pidió que vuelva a encender
         static readonly Stopwatch _age = Stopwatch.StartNew();  // desde que arrancó el proceso (la tarea tiene 4 min)
         static EventWaitHandle _prepareEvent;   // la tarea de respaldo avisa de que se pidió apagar (ir conectando)
         static volatile bool _prepareBySystem;  // el aviso para ir conectando es porque Windows empezó a cerrar la sesión
@@ -256,11 +260,22 @@ namespace LotusLED.Shutdown
             {
                 // Los avisos para encender y para ir conectando existen antes que el mutex: quien vea el mutex ya
                 // puede usarlos
-                _powerOnEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Helper.PowerOnEventNameForGuard);
-                _prepareEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Helper.PrepareEventNameForGuard);
-                _restoreEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Helper.RestoreEventNameForGuard);
                 bool created;
-                _mutex = new Mutex(true, Helper.MutexNameForGuard, out created);
+                try
+                {
+                    _powerOnEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Helper.PowerOnEventNameForGuard);
+                    _prepareEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Helper.PrepareEventNameForGuard);
+                    _restoreEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Helper.RestoreEventNameForGuard);
+                    _mutex = new Mutex(true, Helper.MutexNameForGuard, out created);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    // Son de un ayudante abierto como administrador: vigila él, pero no se le pueden mandar avisos
+                    Log.Write("Ya hay un ayudante abierto como administrador: vigila él" +
+                              (mode == GuardMode.PowerOn ? ", pero no puedo pedirle que encienda." : ".") +
+                              " Ciérralo y vuelve a abrir LotusLED sin \"Ejecutar como administrador\".");
+                    return 0;
+                }
                 if (!created)
                 {
                     // Ya hay un ayudante vigilando en esta sesión (por ejemplo, lo abrió la interfaz o Instalar).
@@ -383,7 +398,7 @@ namespace LotusLED.Shutdown
         /// <summary>
         /// Encender las tiras: al iniciar sesión (si PowerOnStart) o porque lo pide la tarea tras un apagado cancelado
         /// (restore: si estaban encendidas, LightsOn). Una petición que llega mientras se atiende otra no se pierde: la
-        /// que está en marcha vuelve a empezar con las dos y con todas las tiras.
+        /// que está en marcha la junta con la suya (ver PowerOnRun).
         /// </summary>
         static void PowerOnAtStart(bool restore = false)
         {
@@ -423,7 +438,7 @@ namespace LotusLED.Shutdown
         /// </summary>
         static void PowerOnRun(bool logon, bool restore)
         {
-            string what = logon ? "Encender al iniciar" : "Volver a encender";
+            string what = logon && !restore ? "Encender al iniciar" : "Volver a encender";
             var clock = Stopwatch.StartNew();
             var done = new List<ulong>();
             var pending = new List<ulong>();
@@ -436,7 +451,23 @@ namespace LotusLED.Shutdown
             long paused = 0;
             while (!_ending && clock.ElapsedMilliseconds - paused < StartWindowMs)
             {
-                if (PowerOnAsked) return; // otra petición: se vuelve a empezar con las dos
+                // Otra petición mientras tanto: se junta con esta. La de volver a encender viene de un apagado
+                // cancelado que pudo apagarlas: todas otra vez. Otra de iniciar sesión (por ejemplo, el aviso que manda
+                // Start-HelperDetached al ayudante que acaba de abrir con -on) no vuelve a encender las ya encendidas.
+                bool askLogon, askRestore;
+                lock (_powerOnLock)
+                {
+                    askLogon = _askLogon;
+                    askRestore = _askRestore;
+                    _askLogon = _askRestore = false;
+                }
+                if (askLogon) logon = true;
+                if (askRestore)
+                {
+                    restore = true;
+                    done.Clear();
+                }
+                if (askLogon || askRestore) what = logon && !restore ? "Encender al iniciar" : "Volver a encender";
                 var cfg = _cfg;
                 if (cfg == null || !((logon && cfg.PowerOnStart) || (restore && cfg.LightsOn)))
                 {
@@ -703,6 +734,8 @@ namespace LotusLED.Shutdown
             var cur = _round;
             if (cur == null)
             {
+                // Tras volver a la normalidad su vigilancia se había parado: vuelve (WM_ENDSESSION la reprograma)
+                if (_taskResumed) ScheduleTaskCheck(hwnd, ++_taskCheckGen, TaskRecheckMs);
                 _taskResumed = false;
                 StartOff(hwnd, what);
             }
@@ -806,13 +839,16 @@ namespace LotusLED.Shutdown
                             foreach (var kv in res) if (!kv.Value.Ok) pending.Add(kv.Key);
                             // Una orden de encender que no soltó el turno en 4 s pudo salir después de este apagado: en
                             // cuanto lo suelta, se vuelven a apagar (una vez) las que ya se habían apagado. Si aún quedan
-                            // tiras por apagar no se espera: se mira otra vez tras el siguiente intento.
+                            // tiras por apagar no se espera: se mira otra vez tras el siguiente intento. Si no, se espera
+                            // hasta 0,5 s antes del final (que puede crecer), y se deja de esperar si el apagado no sigue.
                             bool resendNow = false;
                             if (!gate && !round.Cancelled)
                             {
-                                long left = Interlocked.Read(ref round.Deadline) - round.Clock.ElapsedMilliseconds;
-                                int wait = pending.Count == 0 ? (int)Math.Max(0, left - 2000) : 0;
-                                if (Monitor.TryEnter(Lights.Gate, wait))
+                                bool got = Monitor.TryEnter(Lights.Gate, 0);
+                                while (!got && pending.Count == 0 && !round.Cancelled &&
+                                       Interlocked.Read(ref round.Deadline) - round.Clock.ElapsedMilliseconds > 500)
+                                    got = Monitor.TryEnter(Lights.Gate, 100);
+                                if (got)
                                 {
                                     gate = true;
                                     if (!resent)
@@ -833,9 +869,9 @@ namespace LotusLED.Shutdown
                             lock (round)
                             {
                                 long leftNow = Interlocked.Read(ref round.Deadline) - round.Clock.ElapsedMilliseconds;
-                                // Aún sin el turno y con tiempo (puede haber crecido mientras se esperaba): se sigue esperando
-                                bool gateWait = !gate && !resent && leftNow > 2100;
-                                if ((pending.Count == 0 && !gateWait) || round.Cancelled || (!resendNow && leftNow < 2000))
+                                // Aún sin el turno y con tiempo (pudo crecer justo al dejar de esperar): se sigue esperando
+                                bool gateWait = !gate && !resent && pending.Count == 0 && !round.Cancelled && leftNow > 500;
+                                if (!gateWait && (pending.Count == 0 || round.Cancelled || (!resendNow && leftNow < 2000)))
                                 {
                                     // Sin el turno, una orden de encender pudo llegar después: no se da por apagada
                                     if (!gate)
@@ -908,7 +944,12 @@ namespace LotusLED.Shutdown
             // terminar la sesión (por ejemplo, alguien pulsó Cancelar en la pantalla de espera). La tarea lo mira con
             // su propio aviso (también si es su segundo apagado: el primero ya gastó los suyos).
             if (_mode != GuardMode.OffNow) ScheduleResumeCheck(hwnd, round.Id, ResumeCheckMs, false);
-            else ScheduleTaskCheck(hwnd, ++_taskCheckGen, ResumeCheckMs); // la de los 75 s ya no vale
+            else
+            {
+                // La de los 75 s ya no vale. Si llega antes el momento de dejar el ayudante (ver HandOff), se mira entonces.
+                long untilHandOff = HandOffAtMs - _age.ElapsedMilliseconds;
+                ScheduleTaskCheck(hwnd, ++_taskCheckGen, (int)Math.Max(5000, Math.Min(ResumeCheckMs, untilHandOff)));
+            }
         }
 
         /// <summary>Apunta en el registro desde otro hilo, esperando como mucho maxWaitMs (sin procesar mensajes).</summary>
@@ -993,7 +1034,17 @@ namespace LotusLED.Shutdown
                     int onBudget = mode == GuardMode.OffNow
                         ? (int)Math.Min(PowerOnTryMs, TaskLimitMs - TaskMarginMs - _age.ElapsedMilliseconds)
                         : PowerOnTryMs;
-                    if (cfg != null && cfg.LightsOn && !_ending && round.Addrs.Count > 0)
+                    // Tarea: si ya dejó el ayudante cerca de su límite (HandOff) y le pidió que vuelva a encender, lo
+                    // hace él (si no, encenderían los dos a la vez)
+                    bool handedOff = false;
+                    if (mode == GuardMode.OffNow && Thread.VolatileRead(ref _handedOff) != 0)
+                    {
+                        _handOffDone.WaitOne(30000);
+                        handedOff = _handOffSent;
+                    }
+                    if (handedOff)
+                        Log.Write("Tarea de respaldo: ya le pedí al ayudante que vuelva a encender; lo hace él.");
+                    else if (cfg != null && cfg.LightsOn && !_ending && round.Addrs.Count > 0)
                     {
                         // Tarea: si Windows vuelve a estar cerrando la sesión (otro apagado), no se enciende (nos llegará
                         // la pregunta). Unos segundos de margen, por si aún no ha bajado el aviso del que se canceló.
@@ -1031,12 +1082,19 @@ namespace LotusLED.Shutdown
                 }
                 // No había ayudante: que se quede uno vigilando para el próximo apagado, y esta tarea se va. Salvo que
                 // entretanto haya empezado otro apagado: mientras Windows cierra la sesión se espera (nos llegará la
-                // pregunta y esta tarea volverá a apagar; si se cancela antes, sigue). El límite de 4 min la cortaría.
+                // pregunta y esta tarea volverá a apagar; si se cancela antes, sigue). Cerca del límite de 4 min se deja
+                // ya el ayudante, con el aviso de volver a encender (HandOff), y se sigue esperando hasta que la corten.
                 if (mode == GuardMode.OffNow)
-                    while (ShuttingDown() && !_ending && gen == Thread.VolatileRead(ref _resumeGen)) Thread.Sleep(500);
+                    while (ShuttingDown() && !_ending && gen == Thread.VolatileRead(ref _resumeGen))
+                    {
+                        if (_age.ElapsedMilliseconds >= HandOffAtMs) HandOff();
+                        Thread.Sleep(500);
+                    }
                 if (mode == GuardMode.OffNow && !_ending && gen == Thread.VolatileRead(ref _resumeGen))
                 {
-                    StartResidentHelper(helperOn);
+                    // Si ya lo dejó HandOff con el aviso de volver a encender, no se le pide otra vez
+                    bool asked = Thread.VolatileRead(ref _handedOff) != 0 && _handOffDone.WaitOne(30000) && _handOffSent;
+                    StartResidentHelper(helperOn && !asked);
                     // Se va desde el hilo de la ventana, mirando otra vez: si mientras tanto Windows volvió a preguntar,
                     // esta tarea se queda apagando
                     Native.PostMessage(hwnd, WM_APP_TASKDONE, (IntPtr)gen, IntPtr.Zero);
@@ -1050,7 +1108,8 @@ namespace LotusLED.Shutdown
         /// Explorador con un acceso directo (como lo abre Windows desde Inicio); solo al final, directamente.
         /// </summary>
         /// <param name="restore">Pedirle que vuelva a encender las tiras, porque a la tarea no le dio tiempo.</param>
-        static void StartResidentHelper(bool restore)
+        /// <returns>Si quedó un ayudante (y, con restore, si se le pudo pedir que vuelva a encender).</returns>
+        static bool StartResidentHelper(bool restore)
         {
             try
             {
@@ -1074,23 +1133,26 @@ namespace LotusLED.Shutdown
                     }
                 }
                 Log.Write("Tarea de respaldo: dejo el ayudante en marcha para el próximo apagado" + how + ".");
-                if (restore)
+                if (!restore) return true;
+                // Sus avisos existen antes que su mutex: se espera a que exista (hasta 20 s, por si aún arranca); sirve
+                // también si el que queda es otro que se abrió a la vez
+                bool sent = false;
+                for (int i = 0; i < 200; i++)
                 {
-                    // Sus avisos existen antes que su mutex: se espera a que exista (hasta 20 s, por si aún arranca); sirve
-                    // también si el que queda es otro que se abrió a la vez
-                    bool sent = false;
-                    for (int i = 0; i < 200; i++)
-                    {
-                        EventWaitHandle e;
-                        try { if (EventWaitHandle.TryOpenExisting(Helper.RestoreEventNameForGuard, out e)) { sent = SetAndClose(e); break; } }
-                        catch (UnauthorizedAccessException) { break; }
-                        Thread.Sleep(100);
-                    }
-                    Log.Write(sent ? "Tarea de respaldo: le pido que vuelva a encender las luces."
-                                   : "Tarea de respaldo: no pude pedirle que vuelva a encender las luces.");
+                    EventWaitHandle e;
+                    try { if (EventWaitHandle.TryOpenExisting(Helper.RestoreEventNameForGuard, out e)) { sent = SetAndClose(e); break; } }
+                    catch (UnauthorizedAccessException) { break; }
+                    Thread.Sleep(100);
                 }
+                Log.Write(sent ? "Tarea de respaldo: le pido que vuelva a encender las luces."
+                               : "Tarea de respaldo: no pude pedirle que vuelva a encender las luces.");
+                return sent;
             }
-            catch (Exception ex) { Log.Write("Tarea de respaldo: no se pudo poner en marcha el ayudante (" + ex.Message + ")."); }
+            catch (Exception ex)
+            {
+                Log.Write("Tarea de respaldo: no se pudo poner en marcha el ayudante (" + ex.Message + ").");
+                return false;
+            }
         }
 
         static bool Elevated()
@@ -1348,19 +1410,27 @@ namespace LotusLED.Shutdown
                 // Cerca del límite (el Programador de tareas la cortará) se deja ya un ayudante con el aviso de volver a
                 // encender: espera mientras Windows cierra la sesión, enciende si este apagado se cancela (y LightsOn) y,
                 // si le llega la pregunta, apaga él
-                if (!_handedOff && _age.ElapsedMilliseconds + TaskRecheckMs >= TaskLimitMs - TaskMarginMs)
-                {
-                    _handedOff = true;
-                    StartThread(() =>
-                    {
-                        Log.Write("Tarea de respaldo: Windows sigue cerrando la sesión y llega mi límite de 4 min; dejo el ayudante.");
-                        StartResidentHelper(true);
-                    });
-                }
+                if (_age.ElapsedMilliseconds >= HandOffAtMs && Thread.VolatileRead(ref _handedOff) == 0) StartThread(HandOff);
                 ScheduleTaskCheck(hwnd, gen, TaskRecheckMs);
                 return;
             }
             Resume(hwnd, "Tarea de respaldo: Windows no llegó a apagarse (se canceló o es un apagado con espera).");
+        }
+
+        /// <summary>
+        /// Tarea de respaldo cerca de su límite de 4 min mientras Windows sigue cerrando la sesión: se deja ya un ayudante
+        /// con el aviso de volver a encender (espera mientras Windows cierra la sesión, enciende si el apagado se cancela
+        /// y LightsOn y, si le llega la pregunta, apaga él). La tarea sigue hasta que la corten. Solo una vez.
+        /// </summary>
+        static void HandOff()
+        {
+            if (Interlocked.CompareExchange(ref _handedOff, 1, 0) != 0) return;
+            try
+            {
+                Log.Write("Tarea de respaldo: Windows sigue cerrando la sesión y llega mi límite de 4 min; dejo el ayudante.");
+                _handOffSent = StartResidentHelper(true);
+            }
+            finally { _handOffDone.Set(); }
         }
 
         static void ScheduleTaskCheck(IntPtr hwnd, int gen, int delayMs)

@@ -45,7 +45,12 @@ function Test-HelperArmed {
     $e = $null
     try {
         if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\LotusLED_Ayudante_Apaga', [ref]$e)) { $e.Dispose(); return $true }
-    } catch {}
+    } catch {
+        # Existe, pero es de un ayudante abierto como administrador: apaga él
+        $ex = $_.Exception
+        while ($ex.InnerException) { $ex = $ex.InnerException }
+        if ($ex -is [System.UnauthorizedAccessException]) { return $true }
+    }
     return $false
 }
 
