@@ -104,13 +104,15 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
 - Windows comparte la conexión BLE entre programas: el ayudante puede escribir aunque la web tenga la tira conectada.
   No guardar conexiones abiertas entre apagados (la tira dejaría de anunciarse).
 - `LotusLED.ps1`: con el ayudante en marcha y con tiras, su aviso SessionEnding no hace nada (apagar desde la web
-  dejaría la tira apagada aunque luego se cancelara el apagado). Nunca abre la ventana al iniciar Windows: sin ayudante válido, el
-  inicio automático no se activa. La espera larga de /api/poll se corta si llega otra petición.
+  dejaría la tira apagada aunque luego se cancelara el apagado). Nunca abre la ventana al iniciar Windows: sin
+  ayudante válido, el inicio automático no se activa. La espera larga de /api/poll se corta si llega otra petición
+  (que no sea otro /api/poll).
 - Versión: `LotusLED.ps1` e `Instalar.ps1` exigen LotusShutdown.exe 1.1.1 o más (la 1.0 tomaba cualquier argumento
   por una MAC y apagaba las luces; la 1.1.0 no atendía el aviso para encender). La actual es la 1.1.2. Si no
   compila, `Instalar` no instala nada.
 - `build.ps1` cierra solo el ayudante de esta carpeta (misma ruta del .exe) antes de compilar (si no, el .exe está
-  bloqueado) y lo vuelve a abrir. Usa /codepage:65001 porque MainForm.cs, BleManager.cs y Program.cs no llevan BOM y tienen acentos.
+  bloqueado) y lo vuelve a abrir. Usa /codepage:65001 porque MainForm.cs, BleManager.cs y Program.cs no llevan BOM
+  y tienen acentos.
 - Instalado en el PC del usuario el 22-nov (rama local suya con el rediseño estilo Apple, sin subir): la prueba
   `-probe` llegó a la tira en 4,4 s.
 
