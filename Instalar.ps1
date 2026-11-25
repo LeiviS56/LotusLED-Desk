@@ -43,7 +43,10 @@ function Test-HelperOk {
 $src = Join-Path $dir 'src\LotusShutdown.cs'
 $needBuild = -not (Test-HelperOk)
 if (-not $needBuild -and (Test-Path $src)) {
-    $needBuild = (Get-Item $src).LastWriteTime -gt (Get-Item $helper).LastWriteTime
+    # También si el .exe es anterior a la 1.1.11 (la tarea al iniciar sesión necesita -detach) aunque su fecha sea
+    # más nueva que la del código (por ejemplo, tras descomprimir encima un ZIP del repositorio)
+    $needBuild = ((Get-Item $src).LastWriteTime -gt (Get-Item $helper).LastWriteTime) -or
+                 ([Version](Get-Item $helper).VersionInfo.FileVersion -lt [Version]'1.1.11.0')
 }
 if ($needBuild) {
     Write-Output "Compilando los .exe (build.ps1)..."
@@ -153,6 +156,31 @@ try {
     Write-Output "  - Tarea programada de respaldo: LotusLED_Shutdown"
 } catch {
     Write-Output "  (No se pudo crear la tarea de respaldo: $($_.Exception.Message))"
+}
+
+# 5b. Tarea programada "al iniciar sesión": abre el ayudante en cuanto entras. El acceso directo de Inicio (paso 4)
+#     pasa por la cola de programas de inicio de Windows, que los abre de uno en uno esperando hasta 30 s a cada
+#     uno, con la carpeta de Inicio al final: el 24-nov el ayudante arrancó 8 minutos después de iniciar sesión. El
+#     acceso se queda por si la tarea falla (si el ayudante ya encendió las luces, no las enciende otra vez).
+#     Con -detach el ayudante se abre aparte, fuera de la tarea, y la tarea termina en segundos; sin límite de tiempo
+#     por si no puede y tiene que vigilar ella.
+try {
+    # -detach lo entiende el ayudante desde la 1.1.11 (uno anterior se quedaría dentro de la tarea y, al llegar el
+    # acceso de Inicio, encendería las luces otra vez)
+    if ([Version](Get-Item $helper).VersionInfo.FileVersion -lt [Version]'1.1.11.0') {
+        Unregister-ScheduledTask -TaskName 'LotusLED_Logon' -Confirm:$false -ErrorAction SilentlyContinue
+        throw 'LotusShutdown.exe es anterior a la 1.1.11; compílalo con build.ps1 y vuelve a instalar'
+    }
+    $me       = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $action   = New-ScheduledTaskAction -Execute $helper -Argument '-watch -on -detach' -WorkingDirectory $dir
+    $trigger  = New-ScheduledTaskTrigger -AtLogOn -User $me
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -Priority 4
+    Register-ScheduledTask -TaskName 'LotusLED_Logon' -Action $action -Trigger $trigger -Settings $settings `
+        -Description 'LotusLED Desk: abre el ayudante de las luces (sin ventana) al iniciar sesión' -Force -ErrorAction Stop | Out-Null
+    Write-Output "  - Tarea programada al iniciar sesión: LotusLED_Logon"
+} catch {
+    Write-Output "  (No se pudo crear la tarea al iniciar sesión: $($_.Exception.Message))"
+    Write-Output "  (Las luces se encenderán igual, pero Windows puede tardar unos minutos en abrir el ayudante.)"
 }
 
 # El ayudante se abre fuera del grupo de procesos (job) del programa que lo abre. El 22-nov lo abrió Claude Code

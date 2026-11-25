@@ -13,7 +13,8 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   `AppSettings.cs` → %LOCALAPPDATA%\LotusLED\settings.cfg) y `LotusShutdown.cs`: el ayudante sin ventana
   (`LotusShutdown.exe -watch -on`, arranca con Windows) que enciende las tiras al iniciar sesión y las apaga al apagar.
 - `build.ps1`: compila los dos .exe con csc.exe de .NET Framework 4 (cada uno tiene su propio Main).
-- `Instalar.ps1/.bat` y `Desinstalar.ps1/.bat`: accesos directos, el ayudante en Inicio (`LotusLED Luces.lnk`)
+- `Instalar.ps1/.bat` y `Desinstalar.ps1/.bat`: accesos directos, el ayudante en Inicio (`LotusLED Luces.lnk`),
+  la tarea programada `LotusLED_Logon` (al iniciar sesión, `-watch -on -detach`: abre el ayudante enseguida)
   y la tarea programada de respaldo `LotusLED_Shutdown` (evento 1074 de USER32, `-task`).
 
 ## Cambios hechos (22-oct-2026, sesión de Cowork)
@@ -182,7 +183,7 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   ayudante válido, el inicio automático no se activa. La espera larga de /api/poll se corta si llega otra petición
   (que no sea otro /api/poll).
 - Versión: `LotusLED.ps1` e `Instalar.ps1` exigen LotusShutdown.exe 1.1.1 o más (la 1.0 tomaba cualquier argumento
-  por una MAC y apagaba las luces; la 1.1.0 no atendía el aviso para encender). La actual es la 1.1.10. Si no
+  por una MAC y apagaba las luces; la 1.1.0 no atendía el aviso para encender). La actual es la 1.1.11. Si no
   compila, `Instalar` no instala nada.
 - El ayudante se abre siempre fuera del job de quien lo abre (`Start-HelperDetached` en build.ps1, Instalar.ps1 y
   LotusLED.ps1, y `StartResidentHelper` en la tarea). Primero lo crea el servicio WMI (`Win32_Process.Create`; medido
@@ -226,10 +227,47 @@ LotusLamp X (controladores L7179 / ELK-BLEDOM / MELK). Proyecto en C#, JavaScrip
   5 pruebas `-probe`: 4,5 s (hubo que buscarla), 10,0 s, 0,3 s, 2,3 s; siempre "leer dio Success". Con la 1.1.3:
   8,1 s, 10,4 s, 9,9 s, no llegó en 16 s, y 6,2 s (casi todo en la fase de servicios, es decir, conectando).
 
+## Arrancar enseguida al iniciar sesión (25-nov-2026, 1.1.11)
+- Comprobado de verdad con la 1.1.10 (LotusShutdown.log del PC del usuario): apagó con el botón el 23-nov 05:32
+  (conexión adelantada en 2,9 s, orden en 191 ms) y el 24-nov 05:00 (1,65 s y 509 ms; sin evento 1074 y con el aviso
+  "forzado"), y encendió en los 3 inicios de sesión (5,9 s, 2,1 s y 1,8 s desde que arrancó el ayudante). Sin "Ojo",
+  sin errores, sin "sin confirmar".
+- Pega: el ayudante arrancaba tarde, 2:08, 2:47 y 8:04 después de iniciar sesión. Causa (registro
+  Microsoft-Windows-Shell-Core/Operational, eventos 9705-9708 y 62408/62409): el Explorador espera ~30 s y abre los
+  programas de inicio de uno en uno, esperando a cada uno hasta que se queda tranquilo o 30 s como mucho, en este
+  orden: HKLM Run, HKCU Run, apps empaquetadas, carpeta de Inicio. El usuario tiene ~16 delante; el 24-nov los 15
+  agotaron sus 30 s. No hay inicio automático con bloqueo (ARSO) ni clave Explorer\Serialize.
+- Arreglo: tarea programada `LotusLED_Logon` ("al iniciar sesión" de ese usuario, sin elevar, sin límite de tiempo,
+  prioridad 4) con `LotusShutdown.exe -watch -on -detach`. No pasa por la cola del Explorador. Con `-detach`
+  (`Guard.Detach`) el ayudante de verdad lo crea el servicio WMI (fuera del job de la tarea, en la sesión del
+  usuario) y el proceso de la tarea termina; si WMI falla o no contesta en 30 s, vigila el propio proceso de la tarea.
+  Como administrador no se usa WMI.
+- El acceso directo de Inicio (`-watch -on`) se queda por si la tarea falla. Cuando por fin se ejecuta, minutos
+  después, ya hay ayudante: le pide encender y termina. El ayudante ya no repite "Encender al iniciar" si en ese
+  inicio ya encendió alguna (`_logonDoneAt`; lo apunta en el registro): si entretanto apagaste las luces a mano, no
+  se vuelven a encender. Si no encendió ninguna, esa segunda petición lo reintenta. Volver a encender tras un apagado
+  cancelado (Restaura) no cambia.
+- El interruptor "Iniciar con Windows" de la web (`Set-Autostart`/`Test-Autostart` en `LotusLED.ps1`) pone y quita
+  las dos cosas (acceso y tarea); la tarea solo se crea si el ayudante es 1.1.11 o más (también en `Instalar`, que
+  además recompila si el .exe es anterior). `Desinstalar` quita la tarea; una tarea creada como administrador no se
+  puede quitar sin serlo: `Desinstalar` y la web lo dicen.
+- Revisión de la 1.1.11 (workflow, 25-nov): 4 hallazgos menores arreglados (lo de arriba, y que `Detach` espera al
+  ayudante que WMI ya creó en vez de quitarle el mutex). Descartado: según la documentación, lo que crea
+  Win32_Process.Create queda en el job del proveedor WMI salvo CREATE_BREAKAWAY_FROM_JOB; medido el 22-nov en este PC
+  queda fuera de todo job, y si no, el ayudante lo apunta ("Ojo") al arrancar.
+- No se tocó la clave Explorer\Serialize (StartupDelayInMSec/WaitForIdleState): adelantaría todos los programas de
+  inicio del usuario, no solo el nuestro.
+- Conexión lenta a ratos (bucle del 22-nov por la tarde, 34 pruebas, todas conectaron): sin cortar la petición, 5 de
+  18 tardaron más de 15 s (hasta 45 s, con la tira anunciándose a -36 dBm); cortando a los ~9 s (`-fresh 10`), 0 de
+  16, pero solo una llegó a empezar de cero, y la conexión adelantada, que ya vuelve a pedir cada 10 s, tardó 30,7 y
+  46,8 s ese mismo rato. No hay prueba de que volver a pedir ayude, así que no se cambió nada. En los 5 usos de verdad
+  (2 apagados, 3 encendidos) Windows conectó en 0,5-2,9 s. Si un día falla, mirar "Conexión adelantada … sin conectar"
+  en el registro; el arreglo de fondo sería tener la tira siempre conectada (el móvil dejaría de verla).
+
 ## Pendiente
-1. Probar de verdad: apagar y encender el PC, y mirar LotusShutdown.log (tiempos del apagado, "hubo que buscarla").
-   Encender al iniciar sesión ya funcionó de verdad el 22-nov (2,7 s). El primer apagado de verdad (05:05) no valió:
-   el ayudante estaba dentro del job de Claude (ver arriba).
+1. Comprobar en el próximo inicio de sesión que la tarea `LotusLED_Logon` abre el ayudante en segundos (línea
+   "Inicio de sesión: ayudante abierto aparte" y "Ayudante en marcha" en LotusShutdown.log) y que el acceso de Inicio,
+   al llegar, no vuelve a encender ("ya se encendieron a las …, no se repite").
 2. Subir los .exe nuevos a una Release de GitHub (v1.1). La Release v1.0 tiene el LotusShutdown.exe antiguo.
 3. No cubierto: suspender (Windows avisa con PBT_APMSUSPEND pero no espera más de ~2 s, y conectar tarda ~8 s),
    hibernar, apagar con el botón si está puesto en "suspender", cortes de luz.

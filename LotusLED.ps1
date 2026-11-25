@@ -25,8 +25,34 @@ $startupLnk = Join-Path $startupDir 'LotusLED Luces.lnk'
 $oldStartupLnk = Join-Path $startupDir 'LotusLED.lnk'   # el de antes, que abría la ventana al iniciar Windows
 $autoCfg = Join-Path $env:LOCALAPPDATA 'LotusLED\auto.cfg'
 
+# La tarea programada "al iniciar sesión" (la crea Instalar.ps1): abre el ayudante en cuanto entras, sin esperar a la
+# cola de programas de inicio de Windows (que deja el acceso directo de Inicio para el final, minutos después). El
+# acceso directo sigue ahí por si la tarea falla. El interruptor de la interfaz quita y pone las dos cosas.
+$logonTask = 'LotusLED_Logon'
+
+function Test-LogonTask {
+    try { return [bool](Get-ScheduledTask -TaskName $logonTask -ErrorAction SilentlyContinue) } catch { return $false }
+}
+
+function Set-LogonTask([bool]$enable) {
+    try {
+        if (-not $enable) {
+            Unregister-ScheduledTask -TaskName $logonTask -Confirm:$false -ErrorAction SilentlyContinue
+            return
+        }
+        # -detach lo entiende el ayudante desde la 1.1.11 (uno anterior se quedaría dentro de la tarea)
+        if ([Version](Get-Item $helperExe).VersionInfo.FileVersion -lt [Version]'1.1.11.0') { return }
+        $me       = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $action   = New-ScheduledTaskAction -Execute $helperExe -Argument '-watch -on -detach' -WorkingDirectory $PSScriptRoot
+        $trigger  = New-ScheduledTaskTrigger -AtLogOn -User $me
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -Priority 4
+        Register-ScheduledTask -TaskName $logonTask -Action $action -Trigger $trigger -Settings $settings `
+            -Description 'LotusLED Desk: abre el ayudante de las luces (sin ventana) al iniciar sesión' -Force -ErrorAction Stop | Out-Null
+    } catch {}
+}
+
 function Test-Autostart {
-    return ((Test-Path $startupLnk) -or (Test-Path $oldStartupLnk))
+    return ((Test-Path $startupLnk) -or (Test-Path $oldStartupLnk) -or (Test-LogonTask))
 }
 
 # El ayudante tiene que ser la versión 1.1.1 o más: la 1.0 tomaba cualquier argumento por una MAC y apagaba las
@@ -59,11 +85,13 @@ function Set-Autostart([bool]$enable) {
     if (Test-Path $oldStartupLnk) { Remove-Item -Force $oldStartupLnk -ErrorAction SilentlyContinue }
     if (-not $enable) {
         if (Test-Path $startupLnk) { Remove-Item -Force $startupLnk -ErrorAction SilentlyContinue }
-        # Si Windows no dejó borrar alguno, sigue activado: que la web no diga lo contrario
-        return (-not (Test-Path $startupLnk) -and -not (Test-Path $oldStartupLnk))
+        Set-LogonTask $false
+        # Si Windows no dejó borrar alguno (o la tarea), sigue activado: que la web no diga lo contrario
+        return (-not (Test-Autostart))
     }
     if (-not (Test-HelperOk)) {
         if (Test-Path $startupLnk) { Remove-Item -Force $startupLnk -ErrorAction SilentlyContinue }
+        Set-LogonTask $false
         return $false
     }
     $ws = New-Object -ComObject WScript.Shell
@@ -76,6 +104,8 @@ function Set-Autostart([bool]$enable) {
     $s.WorkingDirectory = $PSScriptRoot
     if (Test-Path $icoFile) { $s.IconLocation = "$icoFile,0" }
     $s.Save()
+    # Si no se puede crear la tarea no pasa nada: con el acceso directo basta (solo arranca más tarde)
+    Set-LogonTask $true
     return $true
 }
 
@@ -418,7 +448,10 @@ function Handle-Api($ctx, $path) {
             try { $done = [bool](Set-Autostart $enabled) } catch {}
             if ($done -and $enabled) { Start-Helper | Out-Null }
             $answer = @{ ok = $done; autostart = (Test-Autostart) }
-            if (-not $done) { $answer.error = 'Falta LotusShutdown.exe (o es una versión antigua). Ejecuta Instalar.bat.' }
+            if (-not $done) {
+                $answer.error = if ($enabled) { 'Falta LotusShutdown.exe (o es una versión antigua). Ejecuta Instalar.bat.' }
+                                else { 'No se pudo quitar el inicio con Windows (la tarea LotusLED_Logon se creó como administrador). Ejecuta Desinstalar.bat como administrador.' }
+            }
             Send-Json $res $answer
         } else {
             Send-Json $res @{ autostart = (Test-Autostart) }

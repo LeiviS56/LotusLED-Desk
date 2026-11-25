@@ -72,7 +72,7 @@ LotusLED.exe      ─► versión alternativa 100% nativa (WinForms + Bluetooth 
 | `LotusLED.ps1` | Lanzador: servidor local y bandeja del sistema |
 | `src/` | Código C# de la versión nativa (`LotusLED.exe`) y del ayudante `LotusShutdown.exe` |
 | `build.ps1` | Compila los dos `.exe` con el compilador que ya trae Windows |
-| `Instalar.ps1` / `Desinstalar.ps1` | Accesos directos, el ayudante al iniciar Windows y una tarea de respaldo |
+| `Instalar.ps1` / `Desinstalar.ps1` | Accesos directos, el ayudante al iniciar Windows (acceso de Inicio y tarea al iniciar sesión) y una tarea de respaldo |
 
 ## Compilar los .exe
 

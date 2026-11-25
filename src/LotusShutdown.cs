@@ -21,7 +21,13 @@ using Windows.Storage.Streams;
 //   LotusShutdown.exe -watch -on   Se queda en segundo plano, sin ventana ni icono (lo arranca Windows al iniciar
 //                                  sesión). Enciende las tiras al empezar y las apaga al apagar, reiniciar o cerrar
 //                                  sesión: retiene el apagado de Windows unos segundos hasta que la orden llega.
-//                                  Si ya hay uno en marcha, le pide que encienda y termina.
+//                                  Si ya hay uno en marcha, le pide que encienda (una vez por inicio de sesión:
+//                                  si ya las encendió al iniciar, no se repite) y termina.
+//   LotusShutdown.exe -watch -on -detach
+//                                  Lo que usa la tarea programada "al iniciar sesión" (LotusLED_Logon): abre el
+//                                  ayudante aparte, fuera de la tarea, y termina. Así arranca en cuanto entras, sin
+//                                  esperar a la cola de programas de inicio de Windows (el acceso directo de Inicio
+//                                  sigue ahí por si la tarea falla).
 //   LotusShutdown.exe -watch       Igual, pero sin encender las luces al empezar (lo usan LotusLED.ps1 e Instalar).
 //   LotusShutdown.exe              Apaga las tiras ahora y termina.
 //   LotusShutdown.exe -on          Las enciende ahora y termina.
@@ -45,8 +51,8 @@ using Windows.Storage.Streams;
 [assembly: AssemblyTitle("LotusLED Desk - luces")]
 [assembly: AssemblyDescription("Enciende las tiras LED al iniciar Windows y las apaga al apagar el PC")]
 [assembly: AssemblyProduct("LotusLED Desk")]
-[assembly: AssemblyVersion("1.1.10.0")]
-[assembly: AssemblyFileVersion("1.1.10.0")]
+[assembly: AssemblyVersion("1.1.11.0")]
+[assembly: AssemblyFileVersion("1.1.11.0")]
 
 namespace LotusLED.Shutdown
 {
@@ -67,7 +73,7 @@ namespace LotusLED.Shutdown
         [STAThread]
         static int Main(string[] args)
         {
-            bool watch = false, on = false, task = false, probe = false, scan = false, session = false;
+            bool watch = false, on = false, task = false, probe = false, scan = false, session = false, detach = false;
             string findFile = null;
             int findSeconds = 8, probeWait = 30, probeFresh = 0, probeHold = 0;
             var macs = new List<string>();
@@ -82,6 +88,7 @@ namespace LotusLED.Shutdown
                 else if (k == "probe" || k == "probar") probe = true;
                 else if (k == "scan" || k == "escanear") scan = true;
                 else if (k == "session" || k == "sesion" || k == "sesión") session = true;
+                else if (k == "detach" || k == "aparte") detach = true;
                 // Para medir con -probe: cuánto esperar (s), cada cuánto empezar de cero (s) y cuánto guardar la conexión (s)
                 else if ((k == "wait" || k == "fresh" || k == "hold") && i + 1 < args.Length)
                 {
@@ -107,7 +114,12 @@ namespace LotusLED.Shutdown
             {
                 if (findFile != null) return Finder.Run(findFile, findSeconds);
                 if (probe) return Lights.Probe(Config.Addresses(macs), scan, session, probeWait * 1000, probeFresh * 1000, probeHold);
-                if (watch) return Guard.Run(macs, on ? GuardMode.PowerOn : GuardMode.Watch);
+                if (watch)
+                {
+                    // Desde la tarea programada de iniciar sesión: el ayudante se abre aparte y este proceso termina
+                    if (detach && Guard.Detach(macs, on)) return 0;
+                    return Guard.Run(macs, on ? GuardMode.PowerOn : GuardMode.Watch);
+                }
                 if (task) return RunTask(macs);
                 return RunOnce(macs, on);
             }
@@ -212,6 +224,8 @@ namespace LotusLED.Shutdown
         const int TaskMarginMs = 30000;    // volver a encender, dejar el ayudante (hasta 20 s) y salir
         // Si Windows aún está cerrando la sesión, a partir de aquí (~200 s) se deja ya el ayudante (ver HandOff)
         const int HandOffAtMs = TaskLimitMs - TaskMarginMs - TaskRecheckMs;
+        // Tarea de iniciar sesión: cuánto se espera a que WMI abra el ayudante aparte (él ya espera 20 s a que arranque)
+        const int DetachWaitMs = 30000;
 
         public const int WM_APP_OFFDONE = 0x8001;
         public const int WM_APP_RESUMECHECK = 0x8002;
@@ -232,6 +246,8 @@ namespace LotusLED.Shutdown
         static bool _reason;                    // hay motivo de bloqueo puesto
         static readonly object _powerOnLock = new object();
         static bool _powerOnBusy, _askLogon, _askRestore;   // encender: si ya se está atendiendo, y qué se ha pedido
+        static volatile string _logonDoneAt;    // a qué hora acabó de encender al iniciar sesión (null: aún no encendió ninguna)
+        static volatile bool _wmiCreated;       // WMI ya creó el proceso del ayudante (puede estar arrancando todavía)
         static string _stamp;                   // huella de los archivos de configuración de la última lectura
         static EventWaitHandle _armed;          // abierto mientras hay tiras que apagar (lo mira LotusLED.ps1)
         static volatile int _exitCode;          // de la tarea de respaldo: 0 si apagó todas (o no tenía que apagar)
@@ -342,7 +358,19 @@ namespace LotusLED.Shutdown
                     while (true)
                     {
                         _powerOnEvent.WaitOne();
-                        if (!_ending) PowerOnAtStart();
+                        if (_ending) continue;
+                        // Encender al iniciar sesión es una vez por inicio. Desde la 1.1.11 al ayudante lo abre la tarea
+                        // programada nada más entrar, y el acceso directo de Inicio (que Windows abre minutos después,
+                        // al final de su cola) llega cuando ya hay uno: pide encender, pero ya se hizo. Si entretanto
+                        // apagaste las luces a mano, no se vuelven a encender solas.
+                        string at = _logonDoneAt;
+                        if (at != null)
+                        {
+                            Log.Write("Me piden otra vez encender al iniciar (otro arranque del ayudante): ya se hizo a las " +
+                                      at + ", no se repite.");
+                            continue;
+                        }
+                        PowerOnAtStart();
                     }
                 });
                 StartThread(() =>
@@ -581,6 +609,11 @@ namespace LotusLED.Shutdown
             if (pending.Count > 0 && !_ending)
                 Log.Write("No se pudo encender " + Log.List(pending) + " en " + (StartWindowMs / 1000) +
                           " s. ¿Está enchufada, o conectada al móvil?");
+            // Encender al iniciar sesión ya se hizo (todas, o las que contestaron en los 3 min): otra petición igual (el
+            // acceso de Inicio, más tarde) ya no hace nada, tampoco con las que sí se encendieron y luego apagaste a
+            // mano. Si no se encendió ninguna, la siguiente petición lo vuelve a intentar.
+            if (logon && !_ending && done.Count > 0 && _logonDoneAt == null)
+                _logonDoneAt = DateTime.Now.ToString("HH:mm:ss");
         }
 
         /// <summary>
@@ -1166,6 +1199,51 @@ namespace LotusLED.Shutdown
         }
 
         /// <summary>
+        /// Para la tarea programada "al iniciar sesión" (LotusLED_Logon, "-watch -on -detach"): abre el ayudante
+        /// aparte con el servicio WMI, que lo deja fuera del grupo de procesos (job) de la tarea, en la sesión y el
+        /// escritorio del usuario, y este proceso termina. La tarea no pasa por la cola de programas de inicio del
+        /// Explorador, que los abre de uno en uno esperando hasta 30 s a cada uno, con la carpeta de Inicio al final (el
+        /// 24-nov el ayudante arrancó 8 min después de iniciar sesión; el 23-nov, 2 min y casi 3).
+        /// false si no se pudo, o si ya hay un ayudante: entonces sigue este proceso como siempre (si ya hay uno, le
+        /// pide que encienda y termina; si no, vigila él desde dentro de la tarea, que no tiene límite de tiempo).
+        /// </summary>
+        public static bool Detach(List<string> macs, bool on)
+        {
+            try
+            {
+                // Como administrador, WMI lo abriría también como administrador (ver StartResidentHelper)
+                if (MutexExists() || Elevated()) return false;
+                var args = new StringBuilder("-watch");
+                if (on) args.Append(" -on");
+                foreach (var m in macs) args.Append(" \"").Append(m.Replace("\"", "")).Append("\"");
+                string exe = Application.ExecutablePath, dir = Config.ExeDir, cmd = args.ToString();
+                // Con tope: nada más iniciar sesión, WMI puede tardar en contestar. Si llega a abrirlo más tarde, ese
+                // verá que ya hay un ayudante (este) y terminará solo.
+                bool ok = false;
+                var t = new Thread(() => { ok = StartViaWmi(exe, cmd, dir); });
+                t.IsBackground = true;
+                t.Start();
+                bool answered = t.Join(DetachWaitMs);
+                // WMI ya lo creó dentro del tope y aún arranca: se le espera (WaitHelperUp, hasta 20 s) en vez de quitarle
+                // el mutex y quedarnos nosotros dentro de la tarea
+                if (!answered && _wmiCreated) answered = t.Join(25000);
+                if (answered && ok)
+                {
+                    Log.Write("Inicio de sesión: ayudante abierto aparte (fuera de la tarea programada).");
+                    return true;
+                }
+                Log.Write("Inicio de sesión: no pude abrir el ayudante aparte (" + (answered ? "WMI no lo abrió" : "WMI no contesta") +
+                          "); vigilo desde la propia tarea programada.");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Log.Write("Inicio de sesión: no pude abrir el ayudante aparte (" + ex.Message + "); vigilo desde la propia tarea programada.");
+                return false;
+            }
+        }
+
+        /// <summary>
         /// La tarea deja un ayudante vigilando. Se abre fuera del job de la tarea: primero lo crea el servicio WMI
         /// (Win32_Process.Create: sesión 1, WinSta0\\Default y fuera de todo job, medido el 22-nov), y si no, el
         /// Explorador con un acceso directo (como lo abre Windows desde Inicio); solo al final, directamente.
@@ -1259,6 +1337,7 @@ namespace LotusLED.Shutdown
                     var a = new object[] { "\"" + exe + "\" " + args, dir, null, null };
                     object r = cls.InvokeMethod("Create", a);
                     if (Convert.ToInt64(r) != 0) return false;
+                    _wmiCreated = true;
                     return WaitHelperUp(a[3] == null ? 0 : Convert.ToInt32(a[3]));
                 }
             }
