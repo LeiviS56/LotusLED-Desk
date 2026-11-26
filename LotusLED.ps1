@@ -30,8 +30,12 @@ $autoCfg = Join-Path $env:LOCALAPPDATA 'LotusLED\auto.cfg'
 # acceso directo sigue ahí por si la tarea falla. El interruptor de la interfaz quita y pone las dos cosas.
 $logonTask = 'LotusLED_Logon'
 
+# Una tarea deshabilitada en el Programador no arranca nada: no cuenta
 function Test-LogonTask {
-    try { return [bool](Get-ScheduledTask -TaskName $logonTask -ErrorAction SilentlyContinue) } catch { return $false }
+    try {
+        $t = Get-ScheduledTask -TaskName $logonTask -ErrorAction SilentlyContinue
+        return ($null -ne $t -and "$($t.State)" -ne 'Disabled')
+    } catch { return $false }
 }
 
 function Set-LogonTask([bool]$enable) {
@@ -40,8 +44,12 @@ function Set-LogonTask([bool]$enable) {
             Unregister-ScheduledTask -TaskName $logonTask -Confirm:$false -ErrorAction SilentlyContinue
             return
         }
-        # -detach lo entiende el ayudante desde la 1.1.11 (uno anterior se quedaría dentro de la tarea)
-        if ([Version](Get-Item $helperExe).VersionInfo.FileVersion -lt [Version]'1.1.11.0') { return }
+        # -detach lo entiende el ayudante desde la 1.1.11 (uno anterior se quedaría dentro de la tarea y encendería
+        # dos veces): con uno anterior no se crea, y si había una se quita
+        if ([Version](Get-Item $helperExe).VersionInfo.FileVersion -lt [Version]'1.1.11.0') {
+            Unregister-ScheduledTask -TaskName $logonTask -Confirm:$false -ErrorAction SilentlyContinue
+            return
+        }
         $me       = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
         $action   = New-ScheduledTaskAction -Execute $helperExe -Argument '-watch -on -detach' -WorkingDirectory $PSScriptRoot
         $trigger  = New-ScheduledTaskTrigger -AtLogOn -User $me
@@ -450,7 +458,7 @@ function Handle-Api($ctx, $path) {
             $answer = @{ ok = $done; autostart = (Test-Autostart) }
             if (-not $done) {
                 $answer.error = if ($enabled) { 'Falta LotusShutdown.exe (o es una versión antigua). Ejecuta Instalar.bat.' }
-                                else { 'No se pudo quitar el inicio con Windows (la tarea LotusLED_Logon se creó como administrador). Ejecuta Desinstalar.bat como administrador.' }
+                                else { 'No se pudo quitar la tarea LotusLED_Logon (se creó como administrador). Desactívala en el Programador de tareas de Windows.' }
             }
             Send-Json $res $answer
         } else {

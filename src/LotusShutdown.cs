@@ -51,8 +51,8 @@ using Windows.Storage.Streams;
 [assembly: AssemblyTitle("LotusLED Desk - luces")]
 [assembly: AssemblyDescription("Enciende las tiras LED al iniciar Windows y las apaga al apagar el PC")]
 [assembly: AssemblyProduct("LotusLED Desk")]
-[assembly: AssemblyVersion("1.1.11.0")]
-[assembly: AssemblyFileVersion("1.1.11.0")]
+[assembly: AssemblyVersion("1.1.12.0")]
+[assembly: AssemblyFileVersion("1.1.12.0")]
 
 namespace LotusLED.Shutdown
 {
@@ -246,7 +246,9 @@ namespace LotusLED.Shutdown
         static bool _reason;                    // hay motivo de bloqueo puesto
         static readonly object _powerOnLock = new object();
         static bool _powerOnBusy, _askLogon, _askRestore;   // encender: si ya se está atendiendo, y qué se ha pedido
-        static volatile string _logonDoneAt;    // a qué hora acabó de encender al iniciar sesión (null: aún no encendió ninguna)
+        // A qué hora se atendió "encender al iniciar sesión" (encendió alguna, o estaba desactivado); null: aún no.
+        // Se pone con _powerOnLock.
+        static volatile string _logonDoneAt;
         static volatile bool _wmiCreated;       // WMI ya creó el proceso del ayudante (puede estar arrancando todavía)
         static string _stamp;                   // huella de los archivos de configuración de la última lectura
         static EventWaitHandle _armed;          // abierto mientras hay tiras que apagar (lo mira LotusLED.ps1)
@@ -366,7 +368,7 @@ namespace LotusLED.Shutdown
                         string at = _logonDoneAt;
                         if (at != null)
                         {
-                            Log.Write("Me piden otra vez encender al iniciar (otro arranque del ayudante): ya se hizo a las " +
+                            Log.Write("Me piden otra vez encender al iniciar (otro arranque del ayudante): ya se atendió a las " +
                                       at + ", no se repite.");
                             continue;
                         }
@@ -509,6 +511,9 @@ namespace LotusLED.Shutdown
                     bool logon, again;
                     lock (_powerOnLock)
                     {
+                        // Encender al iniciar ya se atendió en este inicio de sesión: una petición igual que llegó
+                        // mientras tanto (el acceso de Inicio, justo al acabar) no abre otra ronda
+                        if (_logonDoneAt != null) _askLogon = false;
                         logon = _askLogon;
                         again = _askRestore;
                         _askLogon = _askRestore = false;
@@ -564,6 +569,9 @@ namespace LotusLED.Shutdown
                 {
                     what = logon && !restore ? "Encender al iniciar" : "Volver a encender";
                     tries = 0; // que el intento siguiente se apunte
+                    // Otro arranque pide encender al iniciar (el acceso de Inicio, minutos después de la tarea) y aún
+                    // no se encendió ninguna: los 3 min vuelven a empezar, como si acabara de arrancar él
+                    if (askLogon && done.Count == 0) { clock.Restart(); paused = 0; }
                 }
                 var cfg = _cfg;
                 if (cfg == null || !((logon && cfg.PowerOnStart) || (restore && cfg.LightsOn)))
@@ -571,6 +579,9 @@ namespace LotusLED.Shutdown
                     if (done.Count == 0)
                         Log.Write(logon && !restore ? "Encender al iniciar está desactivado en la interfaz."
                                                     : "Volver a encender: las luces estaban apagadas.");
+                    // Desactivado al iniciar sesión: atendido (que el acceso de Inicio no encienda a mitad de sesión
+                    // si lo activas luego). Si ya había encendido alguna, también.
+                    if (logon && !_ending) MarkLogonDone();
                     return;
                 }
                 if (ShuttingDown())
@@ -612,8 +623,15 @@ namespace LotusLED.Shutdown
             // Encender al iniciar sesión ya se hizo (todas, o las que contestaron en los 3 min): otra petición igual (el
             // acceso de Inicio, más tarde) ya no hace nada, tampoco con las que sí se encendieron y luego apagaste a
             // mano. Si no se encendió ninguna, la siguiente petición lo vuelve a intentar.
-            if (logon && !_ending && done.Count > 0 && _logonDoneAt == null)
-                _logonDoneAt = DateTime.Now.ToString("HH:mm:ss");
+            if (logon && !_ending && done.Count > 0) MarkLogonDone();
+        }
+
+        static void MarkLogonDone()
+        {
+            lock (_powerOnLock)
+            {
+                if (_logonDoneAt == null) _logonDoneAt = DateTime.Now.ToString("HH:mm:ss");
+            }
         }
 
         /// <summary>
@@ -1212,7 +1230,12 @@ namespace LotusLED.Shutdown
             try
             {
                 // Como administrador, WMI lo abriría también como administrador (ver StartResidentHelper)
-                if (MutexExists() || Elevated()) return false;
+                if (MutexExists()) return false;
+                if (Elevated())
+                {
+                    Log.Write("Inicio de sesión: como administrador el ayudante no se abre aparte; vigilo desde la propia tarea programada.");
+                    return false;
+                }
                 var args = new StringBuilder("-watch");
                 if (on) args.Append(" -on");
                 foreach (var m in macs) args.Append(" \"").Append(m.Replace("\"", "")).Append("\"");
