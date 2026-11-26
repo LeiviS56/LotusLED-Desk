@@ -35,40 +35,44 @@ que usan el protocolo de tramas `7E … EF` (servicio `FFF0`, característica `F
 | ✨ **Efectos** | 22 efectos dinámicos (salto, respiración, fundido, destello) con control de velocidad |
 | 🎵 **Modo música** | Espectro, pulso, arcoíris o golpe al ritmo del audio del PC o del micrófono |
 | 🖥️ **Ambilight** | Las luces copian en tiempo real el color dominante de tu pantalla |
-| ⏻ **Automático** | Se enciende al iniciar sesión y se apaga al apagar o reiniciar el PC |
+| ⏻ **Automático** | Se enciende al iniciar Windows y se apaga al apagar o reiniciar el PC, sin abrir ninguna ventana |
 | 🔔 **Bandeja** | Icono en la bandeja del sistema para encender/apagar sin abrir la ventana |
 | ⏲️ **Temporizador** | Apagado programado |
 
 ## Instalación
 
 1. Descarga el proyecto (**Code → Download ZIP**) y descomprímelo donde quieras.
-2. Haz doble clic en **`Instalar.bat`**.
-3. Cierra LotusLamp X en el móvil (la tira solo acepta una conexión a la vez).
-4. Abre **LotusLED Desk** desde el Escritorio, pulsa **Conectar tiras** y elige tu tira.
+2. Cierra LotusLamp X en el móvil (la tira solo acepta una conexión a la vez).
+3. Haz doble clic en **`Instalar.bat`**. Compila el ayudante, busca tu tira la primera vez (te pregunta cuál
+   es la tuya y la guarda en `device.cfg`) y lo deja todo listo.
 
-Desde ese momento se reconecta sola. Para quitarlo: **`Desinstalar.bat`**.
+Desde ese momento, al iniciar Windows las luces se encienden solas **sin abrir ninguna ventana**, y al apagar,
+reiniciar o cerrar sesión se apagan. Para cambiar el color, abre **LotusLED Desk** desde el Escritorio y pulsa
+**Conectar tiras**. Para quitarlo todo: **`Desinstalar.bat`**.
 
 > **Requisitos:** Windows 10/11 con Bluetooth, y Microsoft Edge o Google Chrome (la interfaz usa Web Bluetooth).
 
 ## Cómo funciona
 
 ```
+LotusShutdown.exe ─► ayudante sin ventana que arranca con Windows: enciende las tiras al iniciar sesión y,
+                     cuando Windows avisa de que se apaga, lo retiene unos segundos hasta que les llega la orden
+                     de apagado (funciona aunque la interfaz esté cerrada)
+
 LotusLED.ps1 ──► servidor local http://localhost:8787 ──► ventana Edge/Chrome (modo app)
      │                                                        │
-     ├─ icono en la bandeja del sistema                       └─ web/ (interfaz + Web Bluetooth → tira LED)
-     └─ al apagar Windows avisa a la interfaz para apagar las luces
+     └─ icono en la bandeja del sistema                       └─ web/ (interfaz + Web Bluetooth → tira LED)
 
-LotusShutdown.exe ─► tarea programada de respaldo que apaga la tira al apagar el PC
 LotusLED.exe      ─► versión alternativa 100% nativa (WinForms + Bluetooth de WinRT)
 ```
 
 | Carpeta / archivo | Qué hace |
 |---|---|
 | `web/` | Interfaz (HTML/CSS/JS): `ble.js` protocolo Bluetooth, `sync.js` música y ambilight, `app.js` lógica |
-| `LotusLED.ps1` | Lanzador: servidor local, bandeja del sistema y aviso de apagado |
-| `src/` | Código C# de la versión nativa (`LotusLED.exe`) y de `LotusShutdown.exe` |
+| `LotusLED.ps1` | Lanzador: servidor local y bandeja del sistema |
+| `src/` | Código C# de la versión nativa (`LotusLED.exe`) y del ayudante `LotusShutdown.exe` |
 | `build.ps1` | Compila los dos `.exe` con el compilador que ya trae Windows |
-| `Instalar.ps1` / `Desinstalar.ps1` | Accesos directos, inicio automático y tarea de apagado |
+| `Instalar.ps1` / `Desinstalar.ps1` | Accesos directos, el ayudante al iniciar Windows (acceso de Inicio y tarea al iniciar sesión) y una tarea de respaldo |
 
 ## Compilar los .exe
 
@@ -78,9 +82,21 @@ No necesitas Visual Studio:
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-Para que `LotusShutdown.exe` sepa qué tira apagar, crea un archivo `device.cfg` junto al `.exe`
-con la MAC de tu tira (por ejemplo `AA:BB:CC:DD:EE:FF`), o pásala como argumento.
-Ese archivo no se sube a GitHub.
+`LotusShutdown.exe` necesita la MAC de tu tira en `device.cfg`, junto al `.exe` (una por línea, por ejemplo
+`AA:BB:CC:DD:EE:FF`). `Instalar.bat` la busca y la guarda por ti. Ese archivo no se sube a GitHub.
+
+| Uso | Qué hace |
+|---|---|
+| `LotusShutdown.exe -watch -on` | Lo que se arranca con Windows: enciende las tiras y se queda vigilando el apagado |
+| `LotusShutdown.exe` | Apaga las tiras ahora |
+| `LotusShutdown.exe -on` | Las enciende ahora |
+| `LotusShutdown.exe -probe` | Comprueba que llega a las tiras sin cambiar las luces (el resultado va al registro) |
+
+Lo que hace queda apuntado en `%LOCALAPPDATA%\LotusLED\LotusShutdown.log`: ahí se ve si la orden llegó
+al apagar y cuánto tardó.
+
+Lo que no cubre: suspender o hibernar el PC (Windows no avisa a los programas; si el botón de encendido está
+puesto en "suspender", tampoco) y los cortes de luz.
 
 ## Protocolo (para curiosos)
 

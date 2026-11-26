@@ -1,13 +1,14 @@
 ﻿<#
   LotusLED Desk - lanzador y servidor de fondo
   Sirve la interfaz en http://localhost:8787 (Web Bluetooth necesita un origen seguro),
-  gestiona el icono en la bandeja del sistema (System Tray), el arranque automático con Windows
-  y el apagado de luces cuando se apaga el PC.
+  gestiona el icono en la bandeja del sistema (System Tray) y el arranque automático con Windows.
+  Encender las luces al iniciar Windows y apagarlas al apagar el PC lo hace LotusShutdown.exe, un ayudante
+  sin ventana que este script pone en marcha; así funciona aunque la ventana esté cerrada.
 #>
 param(
     [int]$Port = 8787,
     [switch]$NoWindow,   # solo servidor (no abre ventana)
-    [switch]$Startup     # invocado al iniciar sesión en Windows
+    [switch]$Startup     # accesos de inicio antiguos: ahora solo arranca el ayudante, sin ventana
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,26 +19,249 @@ $root = Join-Path $PSScriptRoot 'web'
 $url = "http://localhost:$Port/"
 $profileDir = Join-Path $env:LOCALAPPDATA 'LotusLED\BrowserProfile'
 $icoFile = Join-Path $PSScriptRoot 'LotusLED.ico'
-$startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'LotusLED.lnk'
+$helperExe = Join-Path $PSScriptRoot 'LotusShutdown.exe'
+$startupDir = [Environment]::GetFolderPath('Startup')
+$startupLnk = Join-Path $startupDir 'LotusLED Luces.lnk'
+$oldStartupLnk = Join-Path $startupDir 'LotusLED.lnk'   # el de antes, que abría la ventana al iniciar Windows
+$autoCfg = Join-Path $env:LOCALAPPDATA 'LotusLED\auto.cfg'
 
-function Test-Autostart {
-    return (Test-Path $startupLnk)
+# La tarea programada "al iniciar sesión" (la crea Instalar.ps1): abre el ayudante en cuanto entras, sin esperar a la
+# cola de programas de inicio de Windows (que deja el acceso directo de Inicio para el final, minutos después). El
+# acceso directo sigue ahí por si la tarea falla. El interruptor de la interfaz quita y pone las dos cosas.
+$logonTask = 'LotusLED_Logon'
+
+# Una tarea deshabilitada en el Programador no arranca nada: no cuenta
+function Test-LogonTask {
+    try {
+        $t = Get-ScheduledTask -TaskName $logonTask -ErrorAction SilentlyContinue
+        return ($null -ne $t -and "$($t.State)" -ne 'Disabled')
+    } catch { return $false }
 }
 
-function Set-Autostart([bool]$enable) {
-    if ($enable) {
-        $ws = New-Object -ComObject WScript.Shell
-        $s = $ws.CreateShortcut($startupLnk)
-        $s.TargetPath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-        $s.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSScriptRoot\LotusLED.ps1`" -Startup"
-        $s.WorkingDirectory = $PSScriptRoot
-        if (Test-Path $icoFile) { $s.IconLocation = "$icoFile,0" }
-        $s.WindowStyle = 7 # Minimizada
-        $s.Description = "Controlador de tiras LED (LotusLED Desk)"
-        $s.Save()
-    } else {
-        if (Test-Path $startupLnk) { Remove-Item -Force $startupLnk -ErrorAction SilentlyContinue }
+function Set-LogonTask([bool]$enable) {
+    try {
+        if (-not $enable) {
+            Unregister-ScheduledTask -TaskName $logonTask -Confirm:$false -ErrorAction SilentlyContinue
+            return
+        }
+        # -detach lo entiende el ayudante desde la 1.1.11 (uno anterior se quedaría dentro de la tarea y encendería
+        # dos veces): con uno anterior no se crea, y si había una se quita
+        if ([Version](Get-Item $helperExe).VersionInfo.FileVersion -lt [Version]'1.1.11.0') {
+            Unregister-ScheduledTask -TaskName $logonTask -Confirm:$false -ErrorAction SilentlyContinue
+            return
+        }
+        $me       = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $action   = New-ScheduledTaskAction -Execute $helperExe -Argument '-watch -on -detach' -WorkingDirectory $PSScriptRoot
+        $trigger  = New-ScheduledTaskTrigger -AtLogOn -User $me
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -Priority 4
+        Register-ScheduledTask -TaskName $logonTask -Action $action -Trigger $trigger -Settings $settings `
+            -Description 'LotusLED Desk: abre el ayudante de las luces (sin ventana) al iniciar sesión' -Force -ErrorAction Stop | Out-Null
+    } catch {}
+}
+
+function Test-Autostart {
+    return ((Test-Path $startupLnk) -or (Test-Path $oldStartupLnk) -or (Test-LogonTask))
+}
+
+# El ayudante tiene que ser la versión 1.1.1 o más: la 1.0 tomaba cualquier argumento por una MAC y apagaba las
+# luces, y la 1.1.0 no atendía el aviso para encender de un segundo "-watch -on"
+function Test-HelperOk {
+    if (-not (Test-Path $helperExe)) { return $false }
+    try {
+        $v = [Version](Get-Item $helperExe).VersionInfo.FileVersion
+        return ($v -ge [Version]'1.1.1.0')
+    } catch { return $false }
+}
+
+# ¿Hay un ayudante en marcha que vaya a apagar alguna tira al apagar el PC? (lo tiene abierto solo si tiene MAC y
+# la opción activada; sin MAC, o con uno de antes de la 1.1.2, apaga la ventana web como siempre)
+function Test-HelperArmed {
+    $e = $null
+    try {
+        if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\LotusLED_Ayudante_Apaga', [ref]$e)) { $e.Dispose(); return $true }
+    } catch {
+        # Existe, pero es de un ayudante abierto como administrador: apaga él
+        $ex = $_.Exception
+        while ($ex.InnerException) { $ex = $ex.InnerException }
+        if ($ex -is [System.UnauthorizedAccessException]) { return $true }
     }
+    return $false
+}
+
+# Devuelve si quedó como se pidió. Sin el ayudante no se crea nada: abrir la ventana al iniciar Windows no es una opción.
+function Set-Autostart([bool]$enable) {
+    if (Test-Path $oldStartupLnk) { Remove-Item -Force $oldStartupLnk -ErrorAction SilentlyContinue }
+    if (-not $enable) {
+        if (Test-Path $startupLnk) { Remove-Item -Force $startupLnk -ErrorAction SilentlyContinue }
+        Set-LogonTask $false
+        # Si Windows no dejó borrar alguno (o la tarea), sigue activado: que la web no diga lo contrario
+        return (-not (Test-Autostart))
+    }
+    if (-not (Test-HelperOk)) {
+        if (Test-Path $startupLnk) { Remove-Item -Force $startupLnk -ErrorAction SilentlyContinue }
+        Set-LogonTask $false
+        return $false
+    }
+    $ws = New-Object -ComObject WScript.Shell
+    $s = $ws.CreateShortcut($startupLnk)
+    # Sin ventana: el ayudante enciende las luces al iniciar sesión y las apaga al apagar
+    $s.TargetPath = $helperExe
+    $s.Arguments = '-watch -on'
+    $s.Description = 'LotusLED Desk: enciende las luces al iniciar Windows y las apaga al apagar (sin ventana)'
+    $s.WindowStyle = 1
+    $s.WorkingDirectory = $PSScriptRoot
+    if (Test-Path $icoFile) { $s.IconLocation = "$icoFile,0" }
+    $s.Save()
+    # Si no se puede crear la tarea no pasa nada: con el acceso directo basta (solo arranca más tarde)
+    Set-LogonTask $true
+    return $true
+}
+
+# ¿El acceso de Inicio ya apunta al ayudante? (uno de una versión anterior podía abrir PowerShell)
+function Test-AutostartIsHelper {
+    if (-not (Test-Path $startupLnk)) { return $false }
+    try {
+        $s = (New-Object -ComObject WScript.Shell).CreateShortcut($startupLnk)
+        return ($s.TargetPath -eq $helperExe -and $s.Arguments -eq '-watch -on')
+    } catch { return $false }
+}
+
+# El ayudante se abre fuera del grupo de procesos (job) del programa que lo abre. El 22-nov lo abrió Claude Code
+# durante unas pruebas, quedó en el job de Claude y, al apagar el PC, se cerró con Claude antes de que Windows le
+# avisara: no apagó las luces. Primero lo crea el servicio WMI (Win32_Process.Create: en la sesión y el escritorio del
+# usuario y fuera de todo job, medido el 22-nov; no si se ejecuta como administrador). Si no, el Explorador, con un
+# acceso directo junto al .exe, como lo abre Windows desde Inicio (no en AppData: lo que crea allí un programa
+# empaquetado, MSIX, Windows puede guardarlo en otro sitio y el Explorador no lo vería). Solo al final se abre
+# directamente. Si ya ha aparecido uno no se abre otro: uno lento de arrancar no tiene que perder contra el siguiente.
+# Si ya hay uno en marcha no se abre otro. Con -on se le pide que encienda, también si el que queda en marcha es otro
+# que se abrió a la vez.
+function Start-HelperDetached([string]$Exe, [string]$Arguments, [string]$Dir) {
+    # Si su mutex existe (si es de uno abierto como administrador no se puede abrir, pero existe)
+    $isUp = {
+        $mm = $null
+        try {
+            if ([System.Threading.Mutex]::TryOpenExisting('Local\LotusLED_Ayudante_Luces', [ref]$mm)) { $mm.Dispose(); $true } else { $false }
+        } catch { $true }
+    }
+    # Con -on, el aviso de encender: sus avisos existen antes que su mutex; se espera hasta 20 s por si aún arranca
+    $askOn = {
+        if ($Arguments -match '-on') {
+            for ($i = 0; $i -lt 200; $i++) {
+                $e = $null
+                try {
+                    if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\LotusLED_Ayudante_Encender', [ref]$e)) {
+                        [void]$e.Set(); $e.Dispose(); break
+                    }
+                } catch { break }
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    }
+    if (& $isUp) { & $askOn; return }
+    $session = (Get-Process -Id $PID).SessionId
+    # Si hay un ayudante (-watch) arrancando en esta sesión (uno con -probe o -find no cuenta)
+    $starting = {
+        @(Get-CimInstance Win32_Process -Filter "Name='LotusShutdown.exe' AND SessionId=$session" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match '-watch' }).Count -gt 0
+    }
+    # Espera a que aparezca su mutex: con el proceso abierto, mientras siga vivo, hasta 20 s; sin él (Explorador), 10 s,
+    # y 10 s más si ya hay un ayudante arrancando
+    $waitUp = {
+        param([int]$procId)
+        for ($i = 0; $i -lt 200; $i++) {
+            if (& $isUp) { return $true }
+            if ($procId -gt 0) {
+                if (-not (Get-Process -Id $procId -ErrorAction SilentlyContinue)) { return (& $isUp) }
+            } elseif ($i -ge 100 -and -not (& $starting)) { break }
+            Start-Sleep -Milliseconds 100
+        }
+        return ((& $isUp) -or (& $starting))
+    }
+    $up = $false
+    # Como administrador, WMI lo abriría también como administrador (y los demás programas no podrían abrir su mutex
+    # ni sus avisos): entonces solo el Explorador, que lo abre como usuario normal
+    $elevated = $false
+    try {
+        $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {}
+    if (-not $elevated) {
+        try {
+            $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -ErrorAction Stop `
+                -Arguments @{ CommandLine = "`"$Exe`" $Arguments"; CurrentDirectory = $Dir }
+            if ($r.ReturnValue -eq 0) { $up = & $waitUp ([int]$r.ProcessId) }
+        } catch {}
+    }
+    if (-not $up) {
+        $name = if ($Arguments -match '-on') { 'Ayudante (encender).lnk' } else { 'Ayudante.lnk' }
+        try {
+            $shell = @(Get-Process -Name 'explorer' -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })
+            if ($shell.Count -gt 0) {
+                $lnk = $null
+                foreach ($folder in @($Dir, (Join-Path $env:LOCALAPPDATA 'LotusLED'))) {
+                    try {
+                        New-Item -ItemType Directory -Force -Path $folder | Out-Null
+                        $path = Join-Path $folder $name
+                        $s = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
+                        $s.TargetPath = $Exe
+                        $s.Arguments = $Arguments
+                        $s.WorkingDirectory = $Dir
+                        $s.Save()
+                        if (Test-Path -LiteralPath $path) { $lnk = $path; break }
+                    } catch {}
+                }
+                if ($lnk) {
+                    Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList "`"$lnk`""
+                    $up = & $waitUp 0
+                }
+            }
+        } catch {}
+    }
+    if (-not $up -and -not (& $starting)) {
+        Start-Process -FilePath $Exe -ArgumentList $Arguments -WorkingDirectory $Dir | Out-Null
+    }
+    # También si el que queda en marcha es otro que se abrió a la vez sin -on (si es el nuestro, no enciende dos veces
+    # a la vez: lo junta con lo que ya está haciendo)
+    & $askOn
+}
+
+function Start-Helper([switch]$PowerOn) {
+    if (-not (Test-HelperOk)) { return $false }
+    $helperArgs = @('-watch')
+    if ($PowerOn) { $helperArgs += '-on' }
+    try {
+        # Si ya hay uno en marcha, el nuevo se cierra solo (con -on, antes le pide que encienda)
+        Start-HelperDetached $helperExe ($helperArgs -join ' ') $PSScriptRoot
+        return $true
+    } catch { return $false }
+}
+
+# Opciones que lee el ayudante (encender al iniciar, apagar al apagar y si las luces estaban encendidas).
+# El ayudante también escribe aquí (LightsOn=True cuando las enciende al iniciar Windows), así que siempre se
+# compara con lo que hay en el archivo, no con lo último que escribimos nosotros.
+function Read-AutoCfg {
+    try { if (Test-Path $autoCfg) { return [IO.File]::ReadAllText($autoCfg) } } catch {}
+    return ''
+}
+
+function Save-AutoCfg([bool]$powerOnStart, [bool]$powerOffShutdown, [bool]$lightsOn) {
+    $text = "# LotusLED Desk: lo escribe la interfaz y lo lee LotusShutdown.exe (el ayudante sin ventana)`r`n" +
+            "PowerOnStart=$powerOnStart`r`nPowerOffShutdown=$powerOffShutdown`r`nLightsOn=$lightsOn`r`n"
+    if ($text -eq (Read-AutoCfg)) { return }
+    try {
+        New-Item -ItemType Directory -Force -Path (Split-Path $autoCfg) | Out-Null
+        [IO.File]::WriteAllText($autoCfg, $text)
+    } catch {}
+}
+
+# Arranque con Windows desde un acceso antiguo: ya no se abre la ventana (ni minimizada). Se pone en marcha el
+# ayudante (que enciende las luces) y el acceso se cambia por el nuevo. Sin ayudante no se hace nada.
+if ($Startup) {
+    if (Test-HelperOk) {
+        Start-Helper -PowerOn | Out-Null
+        if ((Test-Path $oldStartupLnk) -or -not (Test-AutostartIsHelper)) { try { Set-Autostart $true | Out-Null } catch {} }
+    }
+    exit 0
 }
 
 function Find-Browser {
@@ -82,6 +306,9 @@ function Test-WindowOpen {
     return [bool]($procs | Where-Object { $_.CommandLine -like '*LotusLED\BrowserProfile*' })
 }
 
+# El ayudante vigila el apagado aunque luego se cierre la ventana
+Start-Helper | Out-Null
+
 # Inicializar servidor HTTP
 $listener = [System.Net.HttpListener]::new()
 $listener.Prefixes.Add($url)
@@ -96,7 +323,11 @@ try {
 # Variables de estado del backend
 $script:running = $true
 $script:isShuttingDown = $false
+$script:shutdownWatch = $null       # desde cuándo: si a los 25 s seguimos vivos, Windows canceló el apagado
+$script:shutdownDelivered = $false  # ya se avisó a la ventana
 $script:shutdownAck = $false
+$script:pollRes = $null             # respuesta de la petición /api/poll que está esperando
+$script:draining = $false           # la ventana se cerró: se atiende lo pendiente y se sale
 $script:keepInBackground = $true
 $script:eventQueue = New-Object System.Collections.Concurrent.ConcurrentQueue[psobject]
 $script:lastDeviceState = @{
@@ -105,16 +336,34 @@ $script:lastDeviceState = @{
     name = ''
 }
 
-# Suscripción a eventos de apagado del sistema Windows
+# Aviso de apagado de Windows (llega en este mismo hilo, durante DoEvents).
+# Antes se esperaba aquí a /api/shutdown-ack, pero este hilo es el único que atiende peticiones, así que la
+# confirmación no podía llegar y el aviso a la ventana salía tarde. Ahora se contesta al momento la petición
+# /api/poll que la ventana tiene abierta y se atienden aquí mismo las que lleguen hasta que confirma (máx. 2 s).
+# Con el ayudante (LotusShutdown.exe) en marcha y con tiras que apagar no se hace nada: él apaga la tira el último,
+# cuando el navegador ya se cerró, y solo si nadie canceló el apagado. Apagarla desde aquí la dejaría apagada aunque
+# luego se cancelara. Esto queda para cuando no hay ayudante, o no sabe qué tira es (sin MAC en device.cfg).
 $onSessionEnding = {
     param($sender, $e)
+    if (Test-HelperArmed) { return }
     $script:isShuttingDown = $true
-    $script:eventQueue.Enqueue([pscustomobject]@{ event = 'shutdown' })
-    # Esperar hasta 1.2 segundos a que el navegador confirme que mandó el apagado BLE
+    $script:shutdownAck = $false
+    $script:shutdownWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $r = $script:pollRes
+    if ($r) {
+        $script:pollRes = $null
+        $script:shutdownDelivered = $true
+        try { Send-Json $r @{ event = 'shutdown' } } catch {}
+    }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($sw.ElapsedMilliseconds -lt 1400 -and -not $script:shutdownAck) {
-        [System.Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Milliseconds 40
+    while ($sw.ElapsedMilliseconds -lt 2000 -and -not $script:shutdownAck -and $script:acceptTask) {
+        try {
+            $t = $script:acceptTask
+            if ($t.Wait(40) -and [object]::ReferenceEquals($t, $script:acceptTask)) {
+                $script:acceptTask = $listener.GetContextAsync()
+                Send-Static $t.Result
+            }
+        } catch { break }
     }
 }
 [Microsoft.Win32.SystemEvents]::add_SessionEnding($onSessionEnding)
@@ -203,8 +452,15 @@ function Handle-Api($ctx, $path) {
                 $data = $body | ConvertFrom-Json
                 if ($null -ne $data.enabled) { $enabled = [bool]$data.enabled }
             } catch {}
-            Set-Autostart $enabled
-            Send-Json $res @{ ok = $true; autostart = (Test-Autostart) }
+            $done = $false
+            try { $done = [bool](Set-Autostart $enabled) } catch {}
+            if ($done -and $enabled) { Start-Helper | Out-Null }
+            $answer = @{ ok = $done; autostart = (Test-Autostart) }
+            if (-not $done) {
+                $answer.error = if ($enabled) { 'Falta LotusShutdown.exe (o es una versión antigua). Ejecuta Instalar.bat.' }
+                                else { 'No se pudo quitar la tarea LotusLED_Logon (se creó como administrador). Desactívala en el Programador de tareas de Windows.' }
+            }
+            Send-Json $res $answer
         } else {
             Send-Json $res @{ autostart = (Test-Autostart) }
         }
@@ -212,9 +468,26 @@ function Handle-Api($ctx, $path) {
     }
 
     if ($path -eq '/api/poll') {
-        # Comprobar si hay apagado inminente
+        # Si a los 25 s del aviso seguimos aquí, Windows canceló el apagado: todo vuelve a la normalidad
+        if ($script:isShuttingDown -and $script:shutdownWatch -and $script:shutdownWatch.Elapsed.TotalSeconds -gt 25) {
+            $script:isShuttingDown = $false
+            $script:shutdownDelivered = $false
+        }
+
+        # Apagado inminente: avisar una vez y no quedarse esperando
         if ($script:isShuttingDown) {
-            Send-Json $res @{ event = 'shutdown' }
+            if ($script:shutdownDelivered) {
+                Send-Json $res @{ event = 'ping' }
+            } else {
+                $script:shutdownDelivered = $true
+                Send-Json $res @{ event = 'shutdown' }
+            }
+            return
+        }
+
+        # La ventana ya se cerró y estamos atendiendo lo último: no esperar
+        if ($script:draining) {
+            Send-Json $res @{ event = 'ping' }
             return
         }
 
@@ -225,21 +498,38 @@ function Handle-Api($ctx, $path) {
             return
         }
 
-        # Long poll: esperar hasta 15s o hasta que haya evento
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        while ($sw.ElapsedMilliseconds -lt 15000 -and $script:running) {
-            [System.Windows.Forms.Application]::DoEvents()
-            if ($script:isShuttingDown) {
-                Send-Json $res @{ event = 'shutdown' }
-                return
+        # Long poll: esperar hasta 15 s o hasta que haya evento. Si llega el aviso de apagado mientras tanto,
+        # $onSessionEnding contesta esta misma petición ($script:pollRes) y aquí solo hay que salir.
+        # Este hilo es el único que atiende peticiones: si llega otra (por ejemplo, las opciones que se acaban de
+        # cambiar), se corta la espera para que no se pierda si luego se cierra la ventana.
+        $script:pollRes = $res
+        try {
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($sw.ElapsedMilliseconds -lt 15000 -and $script:running) {
+                [System.Windows.Forms.Application]::DoEvents()
+                if (-not [object]::ReferenceEquals($script:pollRes, $res)) { return }
+                if ($script:eventQueue.TryDequeue([ref]$ev)) {
+                    $script:pollRes = $null
+                    Send-Json $res $ev
+                    return
+                }
+                # Llegó otra petición: se corta la espera, salvo que sea otro /api/poll (dos ventanas abiertas
+                # se lo irían pasando sin parar); ese espera su turno, como antes
+                $t = $script:acceptTask
+                if ($t -and $t.IsCompleted) {
+                    $isPoll = $false
+                    try { $isPoll = ($t.Status -eq 'RanToCompletion' -and $t.Result.Request.Url.AbsolutePath -eq '/api/poll') } catch {}
+                    if (-not $isPoll) { break }
+                }
+                Start-Sleep -Milliseconds 80
             }
-            if ($script:eventQueue.TryDequeue([ref]$ev)) {
-                Send-Json $res $ev
-                return
+            if ([object]::ReferenceEquals($script:pollRes, $res)) {
+                $script:pollRes = $null
+                Send-Json $res @{ event = 'ping' }
             }
-            Start-Sleep -Milliseconds 80
+        } finally {
+            if ([object]::ReferenceEquals($script:pollRes, $res)) { $script:pollRes = $null }
         }
-        Send-Json $res @{ event = 'ping' }
         return
     }
 
@@ -260,6 +550,12 @@ function Handle-Api($ctx, $path) {
                 if ($null -ne $data.keepInBackground) {
                     $script:keepInBackground = [bool]$data.keepInBackground
                 }
+                # Para el ayudante sin ventana (LotusShutdown.exe). Sin tira conectada, la web no sabe cómo están
+                # las luces: se deja lo que haya (puede haberlo escrito el ayudante al encenderlas)
+                $lightsOn = if ($data.connected) { [bool]$data.power } else { (Read-AutoCfg) -notmatch '(?m)^LightsOn=False' }
+                $pos = if ($null -ne $data.powerOnStart) { [bool]$data.powerOnStart } else { $true }
+                $pof = if ($null -ne $data.powerOffShutdown) { [bool]$data.powerOffShutdown } else { $true }
+                Save-AutoCfg $pos $pof $lightsOn
                 if ($notifyIcon) {
                     $estado = if ($data.power) { 'Encendido' } else { 'Apagado' }
                     $tip = if ($data.connected) {
@@ -322,21 +618,37 @@ if ($NoWindow) {
 
 $started = Get-Date
 $lastCheck = Get-Date
-$task = $listener.GetContextAsync()
+$script:acceptTask = $listener.GetContextAsync()
 
 try {
     while ($script:running -and $listener.IsListening) {
         [System.Windows.Forms.Application]::DoEvents()
 
-        if ($task.Wait(120)) {
-            Send-Static $task.Result
-            $task = $listener.GetContextAsync()
+        # La espera puede procesar el aviso de apagado, que atiende peticiones por su cuenta y cambia
+        # $script:acceptTask: solo se usa el resultado si la tarea sigue siendo la misma.
+        $t = $script:acceptTask
+        if ($t.Wait(100) -and [object]::ReferenceEquals($t, $script:acceptTask)) {
+            # Primero se pide la siguiente (el aviso de apagado puede necesitarla) y luego se atiende esta
+            $script:acceptTask = $listener.GetContextAsync()
+            Send-Static $t.Result
         }
 
-        # Cuando se cierra la ventana, salir para no consumir memoria RAM
+        # Cuando se cierra la ventana, salir para no consumir memoria RAM (después de atender lo que quede pendiente)
         if (((Get-Date) - $lastCheck).TotalSeconds -ge 3 -and ((Get-Date) - $started).TotalSeconds -ge 10) {
             $lastCheck = Get-Date
-            if (-not (Test-WindowOpen)) { break }
+            if (-not (Test-WindowOpen)) {
+                $script:draining = $true
+                $drain = [System.Diagnostics.Stopwatch]::StartNew()
+                while ($drain.ElapsedMilliseconds -lt 1500) {
+                    $t = $script:acceptTask
+                    if (-not $t.Wait(150)) { break }
+                    if ([object]::ReferenceEquals($t, $script:acceptTask)) {
+                        $script:acceptTask = $listener.GetContextAsync()
+                        Send-Static $t.Result
+                    }
+                }
+                break
+            }
         }
     }
 } finally {

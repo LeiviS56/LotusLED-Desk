@@ -173,21 +173,36 @@
   led.addEventListener('log', (e) => addLog(e.detail));
 
   let reportTimer;
+  let reportPending = false;
+  function sendBackendState() {
+    reportPending = false;
+    fetch('/api/state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // keepalive: que llegue aunque se cierre la ventana justo después (el cuerpo es pequeño)
+      keepalive: true,
+      body: JSON.stringify({
+        connected: led.connected,
+        power: state.power,
+        name: led.info?.name || '',
+        keepInBackground: state.keepInBackground,
+        // Los lee el ayudante sin ventana (LotusShutdown.exe) para encender al iniciar y apagar al apagar
+        powerOnStart: state.powerOnStart,
+        powerOffShutdown: state.powerOffShutdown,
+      }),
+    }).catch(() => {});
+  }
   function reportBackendState() {
     clearTimeout(reportTimer);
-    reportTimer = setTimeout(() => {
-      fetch('/api/state', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          connected: led.connected,
-          power: state.power,
-          name: led.info?.name || '',
-          keepInBackground: state.keepInBackground,
-        }),
-      }).catch(() => {});
-    }, 250);
+    reportPending = true;
+    reportTimer = setTimeout(sendBackendState, 250);
   }
+  // Si se cierra la ventana justo después de apagar o cambiar una opción, que el ayudante se entere igualmente
+  window.addEventListener('pagehide', () => {
+    if (!reportPending) return;
+    clearTimeout(reportTimer);
+    sendBackendState();
+  });
 
   function pushStateToDevice() {
     led.power(state.power);
@@ -259,6 +274,8 @@
     applyIntensity();
     updateSceneMode();
     save();
+    // El ayudante sin ventana tiene que saber si estaban encendidas (por si se cancela un apagado)
+    reportBackendState();
   }
 
   function setColor(rgb, from = null) {
@@ -791,8 +808,8 @@
         if (onChange) onChange(el.checked);
       });
     };
-    bindToggle('opt-power-on-start', 'powerOnStart');
-    bindToggle('opt-power-off-shutdown', 'powerOffShutdown');
+    bindToggle('opt-power-on-start', 'powerOnStart', reportBackendState);
+    bindToggle('opt-power-off-shutdown', 'powerOffShutdown', reportBackendState);
     bindToggle('opt-autoconnect', 'autoConnect');
     bindToggle('opt-restore', 'restoreOnConnect');
     bindToggle('opt-showall', 'showAll');
@@ -810,8 +827,15 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ enabled: e.target.checked }),
           });
-          if (res.ok) {
-            toast(e.target.checked ? 'Inicio automático con Windows activado' : 'Inicio automático desactivado', 'ok');
+          const data = res.ok ? await res.json().catch(() => ({})) : {};
+          if (data.ok === false) {
+            // Sin el ayudante (LotusShutdown.exe) no se puede: abrir la ventana al iniciar Windows no es una opción
+            e.target.checked = !!data.autostart;
+            state.autostart = !!data.autostart;
+            save();
+            toast(data.error || 'No se pudo activar el inicio automático.', 'warn', 7000);
+          } else if (res.ok) {
+            toast(e.target.checked ? 'Al iniciar Windows se encenderán las luces, sin abrir la ventana' : 'Inicio automático desactivado', 'ok');
           }
         } catch {
           toast('No se pudo comunicar con el lanzador de Windows.', 'warn');
@@ -863,11 +887,19 @@
         if (res.ok) {
           const msg = await res.json();
           if (msg.event === 'shutdown') {
-            if (state.powerOffShutdown && led.connected) {
-              led.power(false);
+            // Windows se apaga. LotusShutdown.exe se encarga de apagar la tira; aquí paramos la música o el
+            // ambilight (si no, seguirían mandando colores) y la apagamos también por esta conexión.
+            if (state.powerOffShutdown) {
+              stopSyncModes();
+              if (led.connected) {
+                led.power(false);
+                await led.flush(1500);
+              }
             }
             fetch('/api/shutdown-ack', { method: 'POST' }).catch(() => {});
-            return;
+            // Si dentro de un rato seguimos aquí, el apagado se canceló: seguimos atendiendo al lanzador
+            await new Promise((r) => setTimeout(r, 30000));
+            continue;
           } else if (msg.event === 'set-power') {
             setPower(!!msg.power);
           }

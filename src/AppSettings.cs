@@ -86,6 +86,17 @@ namespace LotusLED
                 }
             }
             catch { }
+
+            // Las mismas opciones para el ayudante sin ventana (LotusShutdown.exe), que también las escribe la interfaz web
+            try
+            {
+                File.WriteAllText(Path.Combine(Path.GetDirectoryName(ConfigPath), "auto.cfg"),
+                    "# LotusLED Desk: lo escribe la interfaz y lo lee LotusShutdown.exe (el ayudante sin ventana)\r\n" +
+                    "PowerOnStart=" + PowerOnStart + "\r\n" +
+                    "PowerOffShutdown=" + PowerOffShutdown + "\r\n" +
+                    "LightsOn=" + Power + "\r\n");
+            }
+            catch { }
         }
     }
 }
